@@ -49,6 +49,7 @@ rules:
   resources:
   - daemonsets
   - statefulsets
+  - deployments
   verbs:
   - '*'
 - apiGroups:
@@ -140,6 +141,18 @@ subjects:
   name: pmem-csi-operator
   namespace: pmem-csi
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pmem-csi-operator-metrics
+  namespace: pmem-csi
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector:
+    name: pmem-csi-operator
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -160,6 +173,8 @@ spec:
       containers:
       - command:
         - /usr/local/bin/pmem-csi-operator
+        - -metrics-addr=:8080
+        - -v=3
         env:
         - name: WATCH_NAMESPACE
           valueFrom:
@@ -175,7 +190,19 @@ spec:
           value: x509ignoreCN=0
         image: intel/pmem-csi-driver:canary
         imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 5
+          httpGet:
+            path: /metrics
+            port: metrics
+            scheme: HTTP
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
         name: pmem-csi-operator
+        ports:
+        - containerPort: 8080
+          name: metrics
         securityContext:
           readOnlyRootFilesystem: true
         volumeMounts:

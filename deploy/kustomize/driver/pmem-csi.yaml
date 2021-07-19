@@ -4,19 +4,35 @@ metadata:
   name: pmem-csi-intel-com-controller
   namespace: default
 ---
+# This role binding corresponds to what the following command creates:
+# oc adm policy add-scc-to-user privileged -z pmem-csi-intel-com-controller
+#
+# One difference is that we don't use the name system:openshift:scc:privileged
+# for the object. That object is managed by oc and the admin, whereas this
+# one here is under control of PMEM-CSI (YAML or operator).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pmem-csi-intel-com-node-openshift-cfg
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+subjects:
+- kind: ServiceAccount
+  name: pmem-csi-intel-com-controller
+  namespace: default
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  labels:
-    pmem-csi.intel.com/deployment: lvm-testing
   name: pmem-csi-intel-com-webhooks
   namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  labels:
-    pmem-csi.intel.com/deployment: lvm-testing
   name: pmem-csi-intel-com-webhooks-cfg
   namespace: default
 rules:
@@ -32,8 +48,6 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  labels:
-    pmem-csi.intel.com/deployment: lvm-testing
   name: pmem-csi-intel-com-webhooks-runner
 rules:
 - apiGroups:
@@ -79,8 +93,6 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  labels:
-    pmem-csi.intel.com/deployment: lvm-testing
   name: pmem-csi-intel-com-webhooks-role-cfg
   namespace: default
 roleRef:
@@ -95,8 +107,6 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  labels:
-    pmem-csi.intel.com/deployment: lvm-testing
   name: pmem-csi-intel-com-webhooks-role
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -107,36 +117,8 @@ subjects:
   name: pmem-csi-intel-com-webhooks
   namespace: default
 ---
-# TODO: is this service still needed?
-apiVersion: v1
-kind: Service
-metadata:
-  name: pmem-csi-intel-com-controller
-  namespace: default
-spec:
-  selector:
-    app.kubernetes.io/name: pmem-csi-controller
-    app.kubernetes.io/instance: pmem-csi.intel.com
-  ports:
-  - port: 10000
-    targetPort: 10000
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: pmem-csi-intel-com-metrics
-  namespace: pmem-csi
-spec:
-  type: NodePort
-  selector:
-    app.kubernetes.io/name: pmem-csi-controller
-    app.kubernetes.io/instance: pmem-csi.intel.com
-  ports:
-  - port: 10010
-    targetPort: 10010
----
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: pmem-csi-intel-com-controller
   namespace: default
@@ -151,7 +133,6 @@ spec:
     matchLabels:
       app.kubernetes.io/name: pmem-csi-controller
       app.kubernetes.io/instance: pmem-csi.intel.com
-  serviceName: pmem-csi-intel-com-controller
   template:
     metadata:
       labels:
@@ -161,15 +142,15 @@ spec:
         app.kubernetes.io/instance: pmem-csi.intel.com
         pmem-csi.intel.com/webhook: ignore
     spec:
-      securityContext:
-        runAsNonRoot: true
-        # UID 1000 is defined in Dockerfile
-        runAsUser: 1000
       serviceAccountName: pmem-csi-intel-com-webhooks
-      # Allow this pod to run on a master node.
+      # Allow this pod to run on all nodes and
+      # prevent eviction (https://github.com/kubernetes-csi/csi-driver-host-path/issues/47#issuecomment-538469081).
       tolerations:
-      - key: "node-role.kubernetes.io/master"
-        effect: "NoSchedule"
+      - effect: NoSchedule
+        operator: Exists
+      - effect: NoExecute
+        operator: Exists
+      priorityClassName: system-cluster-critical
       containers:
       - name: pmem-driver
         image: intel/pmem-csi-driver:canary
@@ -181,12 +162,18 @@ spec:
         - -mode=webhooks
         - -drivername=$(PMEM_CSI_DRIVER_NAME)
         - -nodeSelector={"storage":"pmem"}
-        - -caFile=/certs/ca.crt
+        # ca.crt is present in pmem-csi-intel-com-controller-secret but not required for anything at
+        # the moment.
+        - -caFile=
         - -certFile=/certs/tls.crt
         - -keyFile=/certs/tls.key
         - -schedulerListen=:8000
         securityContext:
           readOnlyRootFilesystem: true
+        resources:
+          requests:
+            memory: 128Mi
+            cpu: 12m
         terminationMessagePath: /dev/termination-log
         volumeMounts:
         - name: webhook-cert
@@ -220,6 +207,11 @@ spec:
     matchLabels:
         app.kubernetes.io/name: pmem-csi-node
         app.kubernetes.io/instance: pmem-csi.intel.com
+  updateStrategy:
+    # These are the defaults, added here explicitly to show that we use them.
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
   template:
     metadata:
       labels:
@@ -230,6 +222,14 @@ spec:
         pmem-csi.intel.com/webhook: ignore
     spec:
       serviceAccountName: pmem-csi-intel-com-controller
+      # Allow this pod to run on all nodes and
+      # prevent eviction (https://github.com/kubernetes-csi/csi-driver-host-path/issues/47#issuecomment-538469081).
+      tolerations:
+      - effect: NoSchedule
+        operator: Exists
+      - effect: NoExecute
+        operator: Exists
+      priorityClassName: system-node-critical
       nodeSelector:
         storage: pmem
       containers:
@@ -252,6 +252,10 @@ spec:
         securityContext:
           privileged: true
           runAsUser: 0
+        resources:
+          requests:
+            memory: 250Mi
+            cpu: 100m
         env:
         - name: KUBE_NODE_NAME
           valueFrom:
@@ -273,6 +277,16 @@ spec:
           mountPath: /dev
         - name: sys-dir
           mountPath: /sys
+        # We also mount the host's /sys into the container under a different path
+        # than /sys because on OpenShift 4.5, the mount at /sys became read-only:
+        # - https://github.com/intel/pmem-csi/issues/786
+        # - https://github.com/containerd/containerd/issues/3221
+        #
+        # The pmem-csi-driver binary will bind-mount /host-sys onto /sys
+        # when it detects that problem to ensure that libndctl works without
+        # modifications.
+        - name: sys-dir
+          mountPath: /host-sys
         - name: socket-dir
           mountPath: /csi
         - name: pmem-state-dir
@@ -287,14 +301,19 @@ spec:
           # that mounted fs.
           mountPropagation: Bidirectional
       - name: driver-registrar
-        image: k8s.gcr.io/sig-storage/csi-node-driver-registrar:v1.X.Y
+        image: k8s.gcr.io/sig-storage/csi-node-driver-registrar:v2.2.0
         imagePullPolicy: IfNotPresent
         args:
         - -v=3
         - --kubelet-registration-path=/var/lib/kubelet/plugins/$(PMEM_CSI_DRIVER_NAME)/csi.sock
         - --csi-address=/csi/csi.sock
+        - --timeout=10s # avoids unlikely test flakes, default is 1s
         securityContext:
           readOnlyRootFilesystem: true
+        resources:
+          requests:
+            memory: 128Mi
+            cpu: 12m
         volumeMounts:
         - name: socket-dir
           mountPath: /csi
@@ -307,7 +326,7 @@ spec:
         - name: PMEM_CSI_DRIVER_NAME
           value: pmem-csi.intel.com
       - name: external-provisioner
-        image: gcr.io/k8s-staging-sig-storage/csi-provisioner:canary
+        image: k8s.gcr.io/sig-storage/csi-provisioner:v2.2.2
         imagePullPolicy: IfNotPresent
         args:
         - -v=3
@@ -318,8 +337,13 @@ spec:
         - --immediate-topology=false
         - --timeout=5m
         - --default-fstype=ext4 # see https://github.com/kubernetes-csi/external-provisioner/issues/328#issuecomment-714801581
+        - --worker-threads=5 # We don't need much concurrency inside a node.
         securityContext:
           readOnlyRootFilesystem: true
+        resources:
+          requests:
+            memory: 128Mi
+            cpu: 12m
         volumeMounts:
         - name: socket-dir
           mountPath: /csi
@@ -363,6 +387,110 @@ spec:
             # because we want to pick up old volumes even when the driver name gets changed.
             path: /var/lib/pmem-csi.intel.com
             type: DirectoryOrCreate
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: DirectoryOrCreate
+        - name: sys-dir
+          hostPath:
+            path: /sys
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pmem-csi-intel-com-node-setup
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pmem-csi-intel-com-node-setup-runner
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pmem-csi-intel-com-node-setup-role
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pmem-csi-intel-com-node-setup-runner
+subjects:
+- kind: ServiceAccount
+  name: pmem-csi-intel-com-node-setup
+---
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: pmem-csi-intel-com-node-setup
+  namespace: default
+  labels:
+    app.kubernetes.io/name: pmem-csi-node-setup
+    app.kubernetes.io/part-of: pmem-csi
+    app.kubernetes.io/component: node-setup
+    app.kubernetes.io/instance: pmem-csi.intel.com
+spec:
+  selector:
+    matchLabels:
+        app.kubernetes.io/name: pmem-csi-node-setup
+        app.kubernetes.io/instance: pmem-csi.intel.com
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pmem-csi-node-setup
+        app.kubernetes.io/part-of: pmem-csi
+        app.kubernetes.io/component: node-setup
+        app.kubernetes.io/instance: pmem-csi.intel.com
+        pmem-csi.intel.com/webhook: ignore
+    spec:
+      serviceAccountName: pmem-csi-intel-com-node-setup
+      # Allow this pod to run on all nodes.
+      tolerations:
+      - effect: NoSchedule
+        operator: Exists
+      - effect: NoExecute
+        operator: Exists
+      nodeSelector:
+        pmem-csi.intel.com/convert-raw-namespaces: force
+      containers:
+      - name: pmem-driver
+        image: intel/pmem-csi-driver:canary
+        imagePullPolicy: IfNotPresent
+        command:
+        - /usr/local/bin/pmem-csi-driver
+        - -v=3
+        - -logging-format=text
+        - -mode=force-convert-raw-namespaces
+        - '-nodeSelector={"storage":"pmem"}'
+        - -nodeid=$(KUBE_NODE_NAME)
+        # Passing /dev to container may cause container creation error because
+        # termination-log is located on /dev/ by default, re-locate to /tmp
+        terminationMessagePath: /tmp/termination-log
+        securityContext:
+          privileged: true
+          runAsUser: 0
+        env:
+        - name: KUBE_NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
+        - name: TERMINATION_LOG_PATH
+          value: /tmp/termination-log
+        volumeMounts:
+        - name : dev-dir
+          mountPath: /dev
+        - name: sys-dir
+          mountPath: /sys
+        - name: sys-dir
+          mountPath: /host-sys
+      volumes:
         - name: dev-dir
           hostPath:
             path: /dev

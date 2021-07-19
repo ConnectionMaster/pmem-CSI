@@ -4,6 +4,12 @@ set -o pipefail
 
 TEST_DIRECTORY=${TEST_DIRECTORY:-$(dirname $(readlink -f $0))}
 source ${TEST_CONFIG:-${TEST_DIRECTORY}/test-config.sh}
+
+if [ "${TEST_DISTRO}" = "openshift" ]; then
+    # The script below uses GoVM. For OpenShift we need a different approach.
+    exec "$TEST_DIRECTORY/start-stop-openshift.sh" start
+fi
+
 TEST_DISTRO=${TEST_DISTRO:-clear}
 DEPLOYMENT_SUFFIX=${DEPLOYMENT_SUFFIX:-govm}
 CLUSTER=${CLUSTER:-${TEST_DISTRO}-${DEPLOYMENT_SUFFIX}}
@@ -29,7 +35,7 @@ KVM_CPU_OPTS="${KVM_CPU_OPTS:-\
  -machine pc,accel=kvm,nvdimm=on}"
 EXTRA_QEMU_OPTS="${EXTRA_QWEMU_OPTS:-\
  -object memory-backend-file,id=mem1,share=${TEST_PMEM_SHARE},\
-mem-path=/data/nvdimm0,size=${TEST_PMEM_MEM_SIZE}M \
+mem-path=/data/nvdimm0,size=$((${TEST_PMEM_MEM_SIZE} * 1024 * 1024 + ${TEST_PMEM_LABEL_SIZE})) \
  -device nvdimm,id=nvdimm1,memdev=mem1,label-size=${TEST_PMEM_LABEL_SIZE} \
 }"
 INIT_CLUSTER=${INIT_CLUSTER:-true}
@@ -65,7 +71,7 @@ case ${TEST_DISTRO} in
     fedora)
         CLOUD_USER=${CLOUD_USER:-fedora}
         EFI=${EFI:-false}
-        TEST_DISTRO_VERSION=${TEST_DISTRO_VERSION:-33}
+        TEST_DISTRO_VERSION=${TEST_DISTRO_VERSION:-34}
         FEDORA_CLOUDIMG_REL=${FEDORA_CLOUDIMG_REL:-1.2}
         IMAGE_URL=${IMAGE_URL:-https://download.fedoraproject.org/pub/fedora/linux/releases/${TEST_DISTRO_VERSION}/Cloud/x86_64/images}
         CLOUD_IMAGE=${CLOUD_IMAGE:-Fedora-Cloud-Base-${TEST_DISTRO_VERSION}-${FEDORA_CLOUDIMG_REL}.x86_64.raw.xz}
@@ -277,7 +283,6 @@ EOF
         vm_name=$(govm list -f '{{select (filterRegexp . "IP" "'${ip}'") "Name"}}') || die "failed to find VM for IP $ip"
         log_name=${CLUSTER_DIRECTORY}/${vm_name}.log
         ssh_script=${CLUSTER_DIRECTORY}/ssh.${vm_id}
-        ((vm_id=vm_id+1))
         if [[ "$vm_name" = *"worker"* ]]; then
             workers_ip+="$ip "
         fi
@@ -287,12 +292,14 @@ EOF
 exec ssh $SSH_ARGS ${CLOUD_USER}@${ip} "\$@"
 EOF
         ) >$ssh_script && chmod +x $ssh_script || die "failed to create $ssh_script"
+        ln -s ssh.${vm_id} ${CLUSTER_DIRECTORY}/ssh.${vm_name}
         ENV_VARS="env$(env_vars) HOSTNAME='$vm_name' IPADDR='$ip'"
         ENV_VARS+=" INIT_KUBERNETES=${INIT_CLUSTER}"
         # The local registry and the master node might be used as insecure registries, enabled that just in case.
         ENV_VARS+=" INSECURE_REGISTRIES='$TEST_INSECURE_REGISTRIES $TEST_LOCAL_REGISTRY pmem-csi-$CLUSTER-master:5000'"
         scp $SSH_ARGS ${TEST_DIRECTORY}/${setup_script} ${CLOUD_USER}@${ip}:. >/dev/null || die "failed to copy install scripts to $vm_name = $ip"
         ssh $SSH_ARGS ${CLOUD_USER}@${ip} "sudo env $ENV_VARS ./$setup_script" </dev/null &> >(log_lines "$vm_name" "$log_name") &
+        ((vm_id=vm_id+1))
         pids+=" $!"
     done
     waitall $pids || die "at least one of the nodes failed"
@@ -365,7 +372,7 @@ function init_kubernetes_cluster() (
     pids=""
     IPS=$(print_ips)
     # in Fedora-3[123] case, add a flag to kernel cmdline and reboot to disable cgroups v2
-    if [[ "$TEST_DISTRO" = "fedora" && "$TEST_DISTRO_VERSION" =~ 3[1-3] ]]; then
+    if [[ "$TEST_DISTRO" = "fedora" && "$TEST_DISTRO_VERSION" =~ 3[1-4] ]]; then
         SYSTEMD_UNIFIED_CGROUP_HIERARCHY=systemd.unified_cgroup_hierarchy
         for ip in ${IPS}; do
             GRUB_BFS=$(ssh $SSH_ARGS ${CLOUD_USER}@${ip} "grep ^GRUB_ENABLE_BLSCFG /etc/default/grub | sed -e \"s;\(GRUB_ENABLE_BLSCFG=\)\(.*\);\2;g\"")
@@ -463,19 +470,21 @@ function init_pmem_regions() {
 }
 
 function check_status() { # intentionally a composite command, so "exit" will exit the main script
-    if ${INIT_CLUSTER} ; then
-        deployments=$(govm list -f '{{select (filterRegexp . "Name" "^'${DEPLOYMENT_ID}'-master$") "Name"}}')
-        if [ ! -z "$deployments" ]; then
-            echo "Kubernetes cluster ${CLUSTER} is already running, using it unchanged."
-            kubernetes_usage
-            exit 0
+    if [ -e "${CLUSTER_DIRECTORY}/ssh.0" ]; then
+        # Directory and thus (presumably) the cluster exists.
+        if ${INIT_CLUSTER}; then
+            # Run some sanity checks.
+            local nodes
+            if ! nodes=$(${CLUSTER_DIRECTORY}/ssh.0 kubectl get nodes); then
+                die "'${CLUSTER_DIRECTORY}/ssh.0 kubectl get nodes' failed"
+            fi
+            num_nodes=$(( $(echo "$nodes" | wc -l) - 1 ))
+            num_ssh=$( ls -1 ${CLUSTER_DIRECTORY}/ssh.* | grep '/ssh.[0-9][0-9]*$' | wc -l )
+            if [ $num_ssh -ne $num_nodes ]; then
+                die "expected number of nodes $num_nodes to match number of ssh scripts $num_ssh"
+            fi
         fi
-    else 
-        vm_count=$(govm list -f '{{select (filterRegexp . "Name" "^'$(node_filter ${NODES[@]})'$") "Name"}}' | wc -l)
-        if [ $vm_count == ${#NODES[@]} ]; then
-            echo "All needed nodes are already running, using them unchanged."
-            exit 0
-        fi
+        exit 0
     fi
 
     if ${TEST_CHECK_KVM} && [ ! -e /dev/kvm ]; then

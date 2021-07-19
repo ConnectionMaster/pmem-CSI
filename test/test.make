@@ -42,89 +42,40 @@ test_generated:
 .PHONY: test_runtime_deps
 test: test_runtime_deps
 
-test_runtime_deps: check-go-version-$(GO_BINARY)
+GO_LICENSES = _work/bin/go-licenses
+
+test_runtime_deps: $(GO_LICENSES)
 	@ if ! diff -c \
 		runtime-deps.csv \
 		<( $(RUNTIME_DEPS) ); then \
 		echo; \
-		echo "runtime-deps.csv not up-to-date. Update RUNTIME_DEPS in test/test.make, rerun, review and finally apply the patch above."; \
+		echo "runtime-deps.csv not up-to-date. Review and finally apply the patch above."; \
 		false; \
 	fi
 
-RUNTIME_DEPS =
+# Because of the dependency on the version check, the command will get
+# installed anew for each invocation. This is desirable because then
+# we really do use the latest version. We cannot lock to a specific one
+# because the go-licenses repo has no tags.
+$(GO_LICENSES): check-go-version-$(GO_BINARY)
+	mkdir -p $(@D)
+	GOBIN=$(abspath $(@D)) $(GO) install github.com/google/go-licenses@latest
 
-# List direct imports of our commands, ignoring the go standard runtime packages.
-RUNTIME_DEPS += diff <(env "GO=$(GO)" hack/list-direct-imports.sh $(IMPORT_PATH) ./cmd/... | grep -v ^github.com/intel/pmem-csi | sort -u) \
-                <(go list std | sort -u) | grep ^'<' | cut -f2- -d' ' |
+# We are using https://github.com/google/go-licenses to track all dependencies of our production binaries.
+RUNTIME_DEPS = $(GO_LICENSES) csv ./cmd/...
 
+# We don't care about the URL to the source code (second column in output),
+# therefore we can ignore all errors related to that.
+RUNTIME_DEPS += 2> >( grep -v -e 'Error discovering URL for' -e 'unsupported package host' -e 'remote not found' -e 'the Git remote .* does not have a valid URL' -e 'cannot determine URL for .* package' >&2 )
 
-# Filter out some packages that aren't really code.
-RUNTIME_DEPS += grep -v -e '^C$$' |
-RUNTIME_DEPS += grep -v -e '^github.com/container-storage-interface/spec/lib/go/csi$$' |
-RUNTIME_DEPS += grep -v -e '^google.golang.org/genproto/googleapis/rpc/status$$' |
-RUNTIME_DEPS += grep -v -e '^github.com/go-logr/logr$$' |
+# We simply throw away the second colume with the URL.
+RUNTIME_DEPS += | sed -e 's/\([^,]*\),[^,]*/\1/'
 
-# Reduce the package import paths to project names + download URL.
-# - strip prefix
-RUNTIME_DEPS += sed -e 's;github.com/intel/pmem-csi/vendor/;;' |
-# - use path inside github.com as project name
-RUNTIME_DEPS += sed -e 's;^github.com/\([^/]*\)/\([^/]*\).*;github.com/\1/\2;' |
-# - same for sigs.k8s.io
-RUNTIME_DEPS += sed -e 's;^sigs.k8s.io/\([^/]*\).*;sigs.k8s.io/\1;' |
-# - everything from gRPC is one project
-RUNTIME_DEPS += sed -e 's;google.golang.org/grpc/*.*;grpc-go,https://github.com/grpc/grpc-go;' |
-# - Kubernetes is split across several repos.
-RUNTIME_DEPS += sed -e 's;^k8s.io/.*\|github.com/kubernetes-csi/.*;kubernetes,https://github.com/kubernetes/kubernetes,12141;' | \
-# - additional Golang repos
-RUNTIME_DEPS += sed -e 's;\(golang.org/x/.*\);Go,https://golang.org/,11382;' | \
-# - various other projects (sorted alphabetically)
-RUNTIME_DEPS += sed \
-	-e 's;\(github.com/PuerkitoBio/purell\);purell,https://\1;' \
-	-e 's;\(github.com/PuerkitoBio/urlesc\);urlesc,https://\1;' \
-	-e 's;\(github.com/beorn7/perks\);perks,https://\1;' \
-	-e 's;\(github.com/cespare/xxhash\);go-xxhash,https://\1;' \
-	-e 's;\(github.com/coreos/prometheus-operator\);Prometheus Operator,https://\1;' \
-	-e 's;\(github.com/davecgh/go-spew\);davecgh/go-spew,https://\1;' \
-	-e 's;\(github.com/docker/go-units\);go-units,https://\1,9173;' \
-	-e 's;\(github.com/emicklei/go-restful\);go-restful,http://\1,10372;' \
-	-e 's;\(github.com/evanphx/json-patch\);json-patch,https://\1;' \
-	-e 's;\(github.com/go-openapi/jsonpointer\);gojsonpointer,https://\1;' \
-	-e 's;\(github.com/go-openapi/jsonreference\);go-openapi jsonreference,https://\1;' \
-	-e 's;\(github.com/go-openapi/spec\);go-openapi spec,https://\1;' \
-	-e 's;\(github.com/go-openapi/swag\);go-openapi/swag,https://\1;' \
-	-e 's;\(github.com/gogo/protobuf\);gogo protobuf,https://\1;' \
-	-e 's;\(github.com/golang/groupcache\);golang-groupcache,https://\1;' \
-	-e 's;\(github.com/golang/protobuf\);golang-protobuf,https://\1;' \
-	-e 's;\(github.com/google/go-cmp\);go-cmp,https://\1;' \
-	-e 's;\(github.com/google/gofuzz\);Google gofuzz,https://\1;' \
-	-e 's;\(github.com/google/uuid\);google uuid,https://\1;' \
-	-e 's;\(github.com/googleapis/gnostic\);gnostic,https://\1;' \
-	-e 's;\(github.com/hashicorp/golang-lru\);golang-lru,https://\1;' \
-	-e 's;\(github.com/imdario/mergo\);mergo,https://\1;' \
-	-e 's;\(github.com/json-iterator/go\);json-iterator,https://\1;' \
-	-e 's;\(github.com/mailru/easyjson\);golang easyjson,https://\1;' \
-	-e 's;\(github.com/matttproud/golang_protobuf_extensions\);golang_protobuf_extensions,https://\1;' \
-	-e 's;\(github.com/modern-go/concurrent\);concurrent,https://\1;' \
-	-e 's;\(github.com/modern-go/reflect2\);reflect2,https://\1;' \
-	-e 's;\(github.com/operator-framework/operator-sdk\);operator-sdk,https://\1;' \
-	-e 's;\(github.com/pkg/errors\);pkg/errors,https://\1;' \
-	-e 's;\(github.com/prometheus/client_golang\);client_golang,https://\1;' \
-	-e 's;\(github.com/prometheus/client_model\);prometheus client_model,https://\1;' \
-	-e 's;\(github.com/prometheus/common\);prometheus_common,https://\1;' \
-	-e 's;\(github.com/prometheus/procfs\);prometheus_procfs,https://\1;' \
-	-e 's;\(github.com/spf13/pflag\);github.com\\spf13\\pflag,https://\1;' \
-	-e 's;\(github.com/vgough/grpc-proxy\);grpc-proxy,https://\1;' \
-	-e 's;gomodules.xyz/jsonpatch/v.*;gomodules jsonpatch,https://github.com/gomodules/jsonpatch;' \
-	-e 's;gopkg.in/fsnotify.*;golang-github-fsnotify-fsnotify,https://github.com/fsnotify/fsnotify;' \
-	-e 's;gopkg.in/inf\.v.*;go-inf,https://github.com/go-inf/inf;' \
-	-e 's;gopkg.in/yaml\.v.*;go-yaml,https://https://github.com/go-yaml/yaml,9476;' \
-	-e 's;sigs.k8s.io/\(.*\);kubernetes-sigs/\1,https://github.com/kubernetes-sigs/\1;' \
-	| cat |
-# - ensure that we have three columns
-RUNTIME_DEPS += sed -e 's;^\([^,]*\),\([^,]*\)$$;\1,\2,;' |
+# We ignore our own source code.
+RUNTIME_DEPS += | grep -v ^github.com/intel/pmem-csi
 
-# Ignore duplicates.
-RUNTIME_DEPS += LC_ALL=C LANG=C sort -u
+# Ignore duplicates and sort.
+RUNTIME_DEPS += | env LC_ALL=C LANG=C sort -u
 
 # Execute simple unit tests.
 #
@@ -135,7 +86,7 @@ RUNTIME_DEPS += LC_ALL=C LANG=C sort -u
 test: run_tests
 RUN_TESTS = TEST_WORK=$(abspath _work) REPO_ROOT=`pwd` \
 	env GODEBUG=x509ignoreCN=0 $(TEST_CMD) -timeout 0 $(filter-out %/pmem-device-manager %/imagefile/test,$(TEST_PKGS))
-RUN_TEST_DEPS = _work/pmem-ca/.ca-stamp _work/evil-ca/.ca-stamp check-go-version-$(GO_BINARY)
+RUN_TEST_DEPS = check-go-version-$(GO_BINARY)
 
 run_tests: $(RUN_TEST_DEPS)
 	$(RUN_TESTS)
@@ -151,6 +102,13 @@ TEST_E2E_SKIP_ALL += should.access.volume.from.different.nodes
 
 # Test is flawed and will become optional soon (probably csi-test 3.2.0): https://github.com/kubernetes-csi/csi-test/pull/258
 TEST_E2E_SKIP_ALL += NodeUnpublishVolume.*should.fail.when.the.volume.is.missing
+
+# Test asks for too small volume and then fails to write the complete file (https://github.com/kubernetes/kubernetes/issues/103718).
+TEST_E2E_SKIP_ALL += volumeIO.*should.write.files.of.various.sizes.*verify.size.*validate.content
+
+# Do not run driver stress tests in direct mode, they are consuming more time(~17m per test)
+# The reason is shredding the ndctl device is consuming most of the time.
+TEST_E2E_SKIP_ALL += direct.*binding.stress.test
 
 # Add all Kubernetes version-specific suppressions.
 TEST_E2E_SKIP_ALL += $(TEST_E2E_SKIP_$(shell cat _work/$(CLUSTER)/kubernetes.version))
@@ -187,7 +145,7 @@ RUN_E2E = KUBECONFIG=`pwd`/_work/$(CLUSTER)/kube.config \
 	) \
 	TEST_CMD='$(TEST_CMD)' \
 	GO='$(GO)' \
-	TEST_PKGS='$(shell for i in $(TEST_PKGS); do if ls $$i/*_test.go 2>/dev/null >&2; then echo $$i; fi; done)' \
+	TEST_PKGS='$(shell for i in ./pkg/pmem-device-manager ./pkg/imagefile/test; do if ls $$i/*_test.go 2>/dev/null >&2; then echo $$i; fi; done)' \
 	$(GO) test -count=1 -timeout 0 -v ./test/e2e -args \
                 -v=5 \
                 -ginkgo.skip='$(subst $(space),|,$(strip $(subst @,$(space),$(TEST_E2E_SKIP_ALL))))' \
@@ -195,7 +153,7 @@ RUN_E2E = KUBECONFIG=`pwd`/_work/$(CLUSTER)/kube.config \
 		-ginkgo.randomizeAllSpecs=false \
 	        $(TEST_E2E_ARGS) \
                 -report-dir=$(TEST_E2E_REPORT_DIR)
-test_e2e: start $(RUN_TEST_DEPS) operator-generate-catalog
+test_e2e: start $(RUN_TEST_DEPS) operator-generate-bundle
 	$(RUN_E2E)
 
 run_dm_tests: TEST_BINARY_NAME=pmem-dm-tests
@@ -211,7 +169,7 @@ run_dm_tests: _work/bin/govm start_test_vm
 
 _work/%/.ca-stamp: test/setup-ca.sh _work/.setupcfssl-stamp
 	rm -rf $(@D)
-	WORKDIR='$(@D)' PATH='$(PWD)/_work/bin/:$(PATH)' NS=default EXTRA_CNS="wrong-node-controller" $<
+	WORKDIR='$(@D)' PATH='$(PWD)/_work/bin/:$(PATH)' NS=default $<
 	touch $@
 
 

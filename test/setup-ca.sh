@@ -16,10 +16,13 @@ if [ $cfssl_found -eq 0 ]; then
     exit 1
 fi
 
+CADIR=$(dirname ${CA})
+mkdir -p "${CADIR}"
 CA_CRT=$(realpath ${CA}.pem)
 CA_KEY=$(realpath ${CA}-key.pem)
 if ! [ -f ${CA_CRT} -a -f ${CA_KEY} ]; then
-  echo "Generating CA certificate ..."
+  echo "Generating CA certificate in $CADIR ..."
+  (cd "$CADIR" &&
   <<EOF cfssl gencert -initca - | cfssljson -bare $(basename $CA)
 {
     "CN": "pmem-ca",
@@ -30,10 +33,11 @@ if ! [ -f ${CA_CRT} -a -f ${CA_KEY} ]; then
     }
 }
 EOF
+)
 fi
 
 # Generate server and client certificates.
-DEFAULT_CNS="pmem-registry pmem-node-controller"
+DEFAULT_CNS="pmem-controller"
 CNS="${DEFAULT_CNS} ${EXTRA_CNS:=""}"
 for name in ${CNS}; do
   echo "Generating Certificate for '$name'(NS=$NS) ..."
@@ -41,12 +45,16 @@ for name in ${CNS}; do
 {
     "CN": "$name",
     "hosts": [
-        $(if [ "$name" = "pmem-registry" ]; then
+        $(if [ "$name" = "pmem-controller" ]; then
              # Some extra names needed for scheduler extender and webhook.
              # The version without intel-com was used by PMEM-CSI < 0.9.0,
              # the version starting with 0.9.0 for the sake of consistency with
              # the pmem-csi.intel.com driver name.
              echo '"127.0.0.1",'
+             # mutating pod webhook
+             echo '"pmem-csi-webhook", "pmem-csi-webhook.'$NS'", "pmem-csi-webhook.'$NS'.svc",'
+             echo '"'$PREFIX'-webhook", "'$PREFIX'-webhook.'$NS'", "'$PREFIX'-webhook.'$NS'.svc",'
+             # scheduler extender
              echo '"pmem-csi-scheduler", "pmem-csi-scheduler.'$NS'", "pmem-csi-scheduler.'$NS'.svc",'
              echo '"'$PREFIX'-scheduler", "'$PREFIX'-scheduler.'$NS'", "'$PREFIX'-scheduler.'$NS'.svc",'
              # And for metrics server.

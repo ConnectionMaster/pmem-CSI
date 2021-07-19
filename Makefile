@@ -38,9 +38,9 @@ MAJOR_MINOR_VERSION:=$(shell echo $(MAJOR_MINOR_PATCH_VERSION) | sed -e 's/\([0-
 # case) and add local machine to no_proxy because some tests may use a
 # local Docker registry. Also exclude 0.0.0.0 because otherwise Go
 # tests using that address try to go through the proxy.
-HTTP_PROXY=$(shell echo "$${HTTP_PROXY:-$${http_proxy}}")
-HTTPS_PROXY=$(shell echo "$${HTTPS_PROXY:-$${https_proxy}}")
-NO_PROXY=$(shell echo "$${NO_PROXY:-$${no_proxy}},$$(ip addr | grep inet6 | grep /64 | sed -e 's;.*inet6 \(.*\)/64 .*;\1;' | tr '\n' ','; ip addr | grep -w inet | grep -e '/\(24\|16\|8\)' | sed -e 's;.*inet \(.*\)/\(24\|16\|8\) .*;\1;' | tr '\n' ',')",0.0.0.0)
+HTTP_PROXY:=$(shell echo "$${HTTP_PROXY:-$${http_proxy}}")
+HTTPS_PROXY:=$(shell echo "$${HTTPS_PROXY:-$${https_proxy}}")
+NO_PROXY:=$(shell echo "$${NO_PROXY:-$${no_proxy}},$$(if command -v ip &>/dev/null; then ip addr | grep inet6 | grep /64 | sed -e 's;.*inet6 \(.*\)/64 .*;\1;' | tr '\n' ','; ip addr | grep -w inet | grep -e '/\(24\|16\|8\)' | sed -e 's;.*inet \(.*\)/\(24\|16\|8\) .*;\1;' | tr '\n' ','; fi)",0.0.0.0)
 export HTTP_PROXY HTTPS_PROXY NO_PROXY
 
 REGISTRY_NAME?=$(shell . test/test-config.sh && echo $${TEST_BUILD_PMEM_REGISTRY})
@@ -114,9 +114,9 @@ push-image push-test-image: push%-image: $(PUSH_IMAGE_DEP)
 
 # This ensures that all sources are available in the "vendor" directory for use
 # inside "docker build".
-populate-vendor-dir:
-	go mod tidy
-	go mod vendor
+populate-vendor-dir: check-go-version-$(GO_BINARY)
+	$(GO_BINARY) mod tidy
+	$(GO_BINARY) mod vendor
 
 .PHONY: print-image-version
 print-image-version:
@@ -138,7 +138,7 @@ include test/start-stop.make
 include test/test.make
 
 #Kustomize latest release version
-KUSTOMIZE_VERSION=v3.8.7
+KUSTOMIZE_VERSION=v4.0.5
 _work/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz:
 	curl -L https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz -o $(abspath $@)
 
@@ -159,28 +159,30 @@ KUSTOMIZE :=
 
 # For each supported Kubernetes version, we provide four different flavors.
 # The "testing" flavor of the generated files contains both
-# the loglevel changes and enables coverage data collection.
+# the loglevel changes but does not enable coverage data collection.
 KUSTOMIZE_KUBERNETES_OUTPUT = \
     deploy/kubernetes-X.XX/pmem-csi-direct.yaml=deploy/kustomize/kubernetes-base-direct \
     deploy/kubernetes-X.XX/pmem-csi-lvm.yaml=deploy/kustomize/kubernetes-base-lvm \
-    deploy/kubernetes-X.XX/pmem-csi-direct-testing.yaml=deploy/kustomize/kubernetes-base-direct-coverage \
-    deploy/kubernetes-X.XX/pmem-csi-lvm-testing.yaml=deploy/kustomize/kubernetes-base-lvm-coverage \
+    deploy/kubernetes-X.XX/pmem-csi-direct-testing.yaml=deploy/kustomize/kubernetes-base-direct-testing \
+    deploy/kubernetes-X.XX/pmem-csi-lvm-testing.yaml=deploy/kustomize/kubernetes-base-lvm-testing \
 
+# Kubernetes versions derived from kubernetes-base.
+#
+# Once we drop support for 1.19, all the remaining versions can
+# be moved back here and the changes for storage capacity
+# tracking can be moved into kubernetes-base and
+# kubernetes-1.20 removed.
 KUSTOMIZE_KUBERNETES_VERSIONS = \
-    1.17 \
-    1.18 \
     1.19 \
-
+    1.20
 KUSTOMIZE += $(foreach version,$(KUSTOMIZE_KUBERNETES_VERSIONS),$(subst X.XX,$(version),$(KUSTOMIZE_KUBERNETES_OUTPUT)))
 
-# Special case Kubernetes 1.19 with alpha features:
-# use different base.
-KUSTOMIZE += $(subst kubernetes-base,kubernetes-1.19-alpha,$(subst X.XX,1.19-alpha,$(KUSTOMIZE_KUBERNETES_OUTPUT)))
+# Deployments that have storage capacity tracking enabled, using the v1beta1 API.
+KUSTOMIZE += $(subst kubernetes-base,kubernetes-1.21,$(subst X.XX,1.21,$(KUSTOMIZE_KUBERNETES_OUTPUT)))
 
 KUSTOMIZE += deploy/common/pmem-storageclass-default.yaml=deploy/kustomize/storageclass
 KUSTOMIZE += deploy/common/pmem-storageclass-ext4.yaml=deploy/kustomize/storageclass-ext4
 KUSTOMIZE += deploy/common/pmem-storageclass-xfs.yaml=deploy/kustomize/storageclass-xfs
-KUSTOMIZE += deploy/common/pmem-storageclass-cache.yaml=deploy/kustomize/storageclass-cache
 KUSTOMIZE += deploy/common/pmem-storageclass-late-binding.yaml=deploy/kustomize/storageclass-late-binding
 KUSTOMIZE += deploy/operator/pmem-csi-operator.yaml=deploy/kustomize/operator
 
@@ -195,7 +197,7 @@ KUSTOMIZE_LOOKUP_KUSTOMIZATION = $(strip $(foreach item,$(KUSTOMIZE),$(if $(filt
 # This function takes the kustomize binary and the name of an output
 # file as arguments and returns the command which produces that file
 # as stdout.
-KUSTOMIZE_INVOCATION = (echo '\# Generated with "make kustomize", do not edit!'; echo; $(1) build --load_restrictor none $(call KUSTOMIZE_LOOKUP_KUSTOMIZATION,$(2)))
+KUSTOMIZE_INVOCATION = (echo '\# Generated with "make kustomize", do not edit!'; echo; $(1) build --load-restrictor LoadRestrictionsNone $(call KUSTOMIZE_LOOKUP_KUSTOMIZATION,$(2)))
 
 $(KUSTOMIZE_OUTPUT): _work/kustomize $(KUSTOMIZE_INPUT)
 	mkdir -p ${@D}
@@ -207,8 +209,7 @@ $(KUSTOMIZE_OUTPUT): _work/kustomize $(KUSTOMIZE_INPUT)
 		echo 'resources: [ pmem-csi.yaml ]' > $$dir/kustomization.yaml; \
 	fi
 
-kustomize: _work/go-bindata clean_kustomize_output $(KUSTOMIZE_OUTPUT)
-	$< -o deploy/bindata_generated.go -pkg deploy deploy/kubernetes-*/*/pmem-csi.yaml deploy/kustomize/webhook/webhook.yaml deploy/kustomize/scheduler/scheduler-service.yaml
+kustomize: clean_kustomize_output $(KUSTOMIZE_OUTPUT)
 
 clean_kustomize_output:
 	rm -rf deploy/kubernetes-*
@@ -223,13 +224,6 @@ clean: clean-kustomize
 clean-kustomize:
 	rm -f _work/kustomize-*
 	rm -f _work/kustomize
-
-.PHONY: clean-go-bindata
-clean: clean-go-bindata
-clean-go-bindata:
-	rm -f _work/go-bindata
-_work/go-bindata:
-	$(GO_BINARY) build -o $@ github.com/go-bindata/go-bindata/go-bindata
 
 .PHONY: test-kustomize $(addprefix test-kustomize-,$(KUSTOMIZE_OUTPUT))
 test: test-kustomize
@@ -256,6 +250,7 @@ BUILDDIR      = _output
 # repo (= github.com/intel/pmem-csi/deploy, a syntax that is only
 # valid there) if set.
 GEN_DOCS = $(SPHINXBUILD) -M html "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O) && \
+	$(SPHINXBUILD) -M html "$(SOURCEDIR)" "$(BUILDDIR)" -b linkcheck2 $(SPHINXOPTS) $(O) && \
 	( ! [ "$$GITHUB_SHA" ] || ! [ "$$GITHUB_REPOSITORY" ] || \
 	  find $(BUILDDIR)/html/ -name '*.html' | \
 	  xargs sed -i -e "s;github.com/intel/pmem-csi/\\(deploy/\\S*\\);github.com/$$GITHUB_REPOSITORY/\\1?ref=$$GITHUB_SHA;g" ) && \

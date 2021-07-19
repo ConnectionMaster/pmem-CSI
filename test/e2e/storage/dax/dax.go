@@ -17,9 +17,11 @@ limitations under the License.
 package dax
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
@@ -27,9 +29,10 @@ import (
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	"k8s.io/kubernetes/test/e2e/framework/volume"
-	"k8s.io/kubernetes/test/e2e/storage/testpatterns"
-	"k8s.io/kubernetes/test/e2e/storage/testsuites"
+	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
 
+	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1beta1"
+	"github.com/intel/pmem-csi/test/e2e/deploy"
 	"github.com/intel/pmem-csi/test/e2e/ephemeral"
 	pmempod "github.com/intel/pmem-csi/test/e2e/pod"
 
@@ -37,47 +40,47 @@ import (
 )
 
 type daxTestSuite struct {
-	tsInfo testsuites.TestSuiteInfo
+	tsInfo storageframework.TestSuiteInfo
 }
 
-var _ testsuites.TestSuite = &daxTestSuite{}
+var _ storageframework.TestSuite = &daxTestSuite{}
 
 // InitDaxTestSuite returns daxTestSuite that implements TestSuite interface
-func InitDaxTestSuite() testsuites.TestSuite {
+func InitDaxTestSuite() storageframework.TestSuite {
 	suite := &daxTestSuite{
-		tsInfo: testsuites.TestSuiteInfo{
+		tsInfo: storageframework.TestSuiteInfo{
 			Name: "dax",
-			TestPatterns: []testpatterns.TestPattern{
-				testpatterns.DefaultFsDynamicPV,
-				testpatterns.Ext4DynamicPV,
-				testpatterns.XfsDynamicPV,
+			TestPatterns: []storageframework.TestPattern{
+				storageframework.DefaultFsDynamicPV,
+				storageframework.Ext4DynamicPV,
+				storageframework.XfsDynamicPV,
 
-				testpatterns.BlockVolModeDynamicPV,
+				storageframework.BlockVolModeDynamicPV,
 			},
 		},
 	}
 	if ephemeral.Supported {
 		suite.tsInfo.TestPatterns = append(suite.tsInfo.TestPatterns,
-			testpatterns.DefaultFsCSIEphemeralVolume,
-			testpatterns.Ext4CSIEphemeralVolume,
-			testpatterns.XfsCSIEphemeralVolume,
+			storageframework.DefaultFsCSIEphemeralVolume,
+			storageframework.Ext4CSIEphemeralVolume,
+			storageframework.XfsCSIEphemeralVolume,
 		)
 	}
 	return suite
 }
 
-func (p *daxTestSuite) GetTestSuiteInfo() testsuites.TestSuiteInfo {
+func (p *daxTestSuite) GetTestSuiteInfo() storageframework.TestSuiteInfo {
 	return p.tsInfo
 }
 
-func (p *daxTestSuite) SkipRedundantSuite(driver testsuites.TestDriver, pattern testpatterns.TestPattern) {
+func (p *daxTestSuite) SkipUnsupportedTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
 }
 
 type local struct {
-	config      *testsuites.PerTestConfig
+	config      *storageframework.PerTestConfig
 	testCleanup func()
 
-	resource *testsuites.VolumeResource
+	resource *storageframework.VolumeResource
 	root     string
 }
 
@@ -85,7 +88,7 @@ const (
 	daxCheckBinary = "_work/pmem-dax-check"
 )
 
-func (p *daxTestSuite) DefineTests(driver testsuites.TestDriver, pattern testpatterns.TestPattern) {
+func (p *daxTestSuite) DefineTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
 	var l local
 
 	f := framework.NewDefaultFramework("dax")
@@ -105,7 +108,7 @@ func (p *daxTestSuite) DefineTests(driver testsuites.TestDriver, pattern testpat
 
 		// Now do the more expensive test initialization.
 		l.config, l.testCleanup = driver.PrepareTest(f)
-		l.resource = testsuites.CreateVolumeResource(driver, l.config, pattern, volume.SizeRange{})
+		l.resource = storageframework.CreateVolumeResource(driver, l.config, pattern, volume.SizeRange{})
 	}
 
 	cleanup := func() {
@@ -135,26 +138,41 @@ func testDaxInPod(
 	root string,
 	volumeMode v1.PersistentVolumeMode,
 	source *v1.VolumeSource,
-	config *testsuites.PerTestConfig,
+	config *storageframework.PerTestConfig,
 	withKataContainers bool,
 ) {
+	expectDax := true
+	if withKataContainers {
+		nodes, err := f.ClientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{
+			LabelSelector: "katacontainers.io/kata-runtime=true",
+		})
+		framework.ExpectNoError(err, "list nodes")
+		if len(nodes.Items) == 0 {
+			// This is a simplified version of the full test where we don't
+			// attempt to use Kata Containers.
+			framework.Logf("no nodes found with Kata Container runtime, skipping testing with it")
+			expectDax = false
+			withKataContainers = false
+		}
+	}
+
 	pod := CreatePod(f, "dax-volume-test", volumeMode, source, config, withKataContainers)
 	defer func() {
 		DeletePod(f, pod)
 	}()
-	checkWithNormalRuntime := testDax(f, pod, root, volumeMode, source, withKataContainers)
+	checkWithNormalRuntime := testDax(f, pod, root, volumeMode, source, withKataContainers, expectDax)
 	DeletePod(f, pod)
 	if checkWithNormalRuntime {
 		testDaxOutside(f, pod, root)
 	}
 }
 
-func CreatePod(
+func getPod(
 	f *framework.Framework,
 	name string,
 	volumeMode v1.PersistentVolumeMode,
 	source *v1.VolumeSource,
-	config *testsuites.PerTestConfig,
+	config *storageframework.PerTestConfig,
 	withKataContainers bool,
 ) *v1.Pod {
 	const (
@@ -164,21 +182,12 @@ func CreatePod(
 	)
 	privileged := volumeMode == v1.PersistentVolumeBlock
 	root := int64(0)
-	pmemUID := int64(1000) // Set explicitly in the PMEM-CSI Dockerfile.
-	pmemGID := int64(1000) // Set indirectly.
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: f.Namespace.Name,
 		},
 		Spec: v1.PodSpec{
-			// Use non-root security context to trigger filesystem
-			// ownership change of the PMEM volume.
-			SecurityContext: &v1.PodSecurityContext{
-				RunAsUser:  &pmemUID,
-				RunAsGroup: &pmemGID,
-				FSGroup:    &pmemGID,
-			},
 			Containers: []v1.Container{
 				{
 					Name:    containerName,
@@ -202,10 +211,22 @@ func CreatePod(
 		pod.Spec.NodeSelector = map[string]string{
 			"katacontainers.io/kata-runtime": "true",
 		}
-		if pod.Labels == nil {
-			pod.Labels = map[string]string{}
+		if pod.Annotations == nil {
+			pod.Annotations = map[string]string{}
 		}
-		pod.Labels["io.katacontainers.config.hypervisor.memory_offset"] = "2147483648" // large enough for all test volumes
+
+		// The additional memory range must be large enough for all test volumes.
+		// https://github.com/kata-containers/kata-containers/blob/main/docs/how-to/how-to-set-sandbox-config-kata.md#hypervisor-options
+		// Must be an uint32.
+		pod.Annotations["io.katacontainers.config.hypervisor.memory_offset"] = "2147483648" // 2GiB
+
+		// FSGroup not supported (?) by Kata Containers
+		// (https://github.com/intel/pmem-csi/issues/987#issuecomment-858350521),
+		// we must run as root.
+		pod.Spec.SecurityContext = &v1.PodSecurityContext{
+			RunAsUser:  &root,
+			RunAsGroup: &root,
+		}
 	} else {
 		e2epod.SetNodeSelection(&pod.Spec, config.ClientNodeSelection)
 	}
@@ -281,11 +302,31 @@ func CreatePod(
 			RunAsGroup: &root,
 		}
 	}
+	return pod
+}
+
+func CreatePod(f *framework.Framework,
+	name string,
+	volumeMode v1.PersistentVolumeMode,
+	source *v1.VolumeSource,
+	config *storageframework.PerTestConfig,
+	withKataContainers bool,
+) *v1.Pod {
+	pod := getPod(f, name, volumeMode, source, config, withKataContainers)
 
 	By(fmt.Sprintf("Creating pod %s", pod.Name))
 	ns := f.Namespace.Name
 	podClient := f.PodClientNS(ns)
 	createdPod := podClient.Create(pod)
+	defer func() {
+		if r := recover(); r != nil {
+			// Delete pod before raising the panic again,
+			// because the caller will not do it when this
+			// function doesn't return normally.
+			DeletePod(f, createdPod)
+			panic(r)
+		}
+	}()
 	podErr := e2epod.WaitForPodRunningInNamespace(f.ClientSet, createdPod)
 	framework.ExpectNoError(podErr, "running pod")
 
@@ -299,6 +340,7 @@ func testDax(
 	volumeMode v1.PersistentVolumeMode,
 	source *v1.VolumeSource,
 	withKataContainers bool,
+	expectDax bool,
 ) bool {
 	ns := f.Namespace.Name
 	containerName := pod.Spec.Containers[0].Name
@@ -309,10 +351,15 @@ func testDax(
 	}
 
 	By("checking that missing DAX support is detected")
-	pmempod.RunInPod(f, root, []string{daxCheckBinary}, daxCheckBinary+" /tmp/no-dax; if [ $? -ne 1 ]; then echo should have reported missing DAX >&2; exit 1; fi", ns, pod.Name, containerName)
+	pmempod.RunInPod(f, root, []string{daxCheckBinary}, "/tmp/"+path.Base(daxCheckBinary)+" /tmp/no-dax; if [ $? -ne 1 ]; then echo should have reported missing DAX >&2; exit 1; fi", ns, pod.Name, containerName)
 
-	By("checking volume for DAX support")
-	pmempod.RunInPod(f, root, []string{daxCheckBinary}, "lsblk; mount | grep /mnt; "+daxCheckBinary+" /mnt/daxtest", ns, pod.Name, containerName)
+	if expectDax {
+		By("checking volume for DAX support")
+		pmempod.RunInPod(f, root, []string{daxCheckBinary}, "lsblk; mount | grep /mnt; /tmp/"+path.Base(daxCheckBinary)+" /mnt/daxtest", ns, pod.Name, containerName)
+	} else {
+		By("checking volume for missing DAX support")
+		pmempod.RunInPod(f, root, []string{daxCheckBinary}, "lsblk; mount | grep /mnt; /tmp/"+path.Base(daxCheckBinary)+" /mnt/daxtest; if [ $? -ne 1 ]; then echo should have reported missing DAX >&2; exit 1; fi", ns, pod.Name, containerName)
+	}
 
 	// Data written in a container running under Kata Containers
 	// should be visible also in a normal container, unless the
@@ -358,4 +405,138 @@ func testDaxOutside(
 	By(fmt.Sprintf("Deleting pod %s", pod.Name))
 	err := e2epod.DeletePodWithWait(f.ClientSet, pod)
 	framework.ExpectNoError(err, "while deleting pod")
+}
+
+// Hugepage page fault testing part starts here
+const (
+	accessHugepagesBinary = "_work/pmem-access-hugepages"
+)
+
+var _ = deploy.DescribeForSome("dax", func(d *deploy.Deployment) bool {
+	// Run these tests for all driver deployments that were created
+	// through the operator, where device mode is Direct.
+	return !d.HasOperator && d.HasDriver && d.Mode == api.DeviceModeDirect
+}, func(d *deploy.Deployment) {
+	var l local
+	f := framework.NewDefaultFramework("dax")
+	init := func() {
+		l = local{}
+
+		// Build pmem-access-hugepages helper binary.
+		l.root = os.Getenv("REPO_ROOT")
+		build := exec.Command("/bin/sh", "-c", os.Getenv("GO")+" build -o "+accessHugepagesBinary+" ./test/cmd/pmem-access-hugepages")
+		build.Stdout = GinkgoWriter
+		build.Stderr = GinkgoWriter
+		build.Dir = l.root
+		By("Compiling with: " + strings.Join(build.Args, " "))
+		err := build.Run()
+		framework.ExpectNoError(err, "compile ./test/cmd/pmem-access-hugepages")
+	}
+
+	config := &storageframework.PerTestConfig{
+		Driver:    nil,
+		Prefix:    "pmem",
+		Framework: f,
+	}
+	fstype := ""
+	vsource := v1.VolumeSource{
+		CSI: &v1.CSIVolumeSource{
+			Driver: "pmem-csi.intel.com",
+			FSType: &fstype,
+			VolumeAttributes: map[string]string{
+				"size": "110Mi",
+			},
+		},
+	}
+	It("should cause hugepage paging event with default fs", func() {
+		init()
+		testHugepageInPod(f, l.root, &vsource, config)
+	})
+	/* there is issue in kubelet causing panic and retry loop when fsType is set to ext4 or xfs.
+		   The following 2 items can be enabled after that gets fixed.
+	           https://github.com/kubernetes/kubernetes/issues/102651
+		        It("should cause hugepage paging event with ext4", func() {
+				init()
+				fsExt4 := "ext4"
+				vsource.CSI.FSType = &fsExt4
+				testHugepageInPod(f, l.root, &vsource, config)
+			})
+			It("should cause hugepage paging event with xfs", func() {
+				init()
+				fsXFS := "xfs"
+				vsource.CSI.FSType = &fsXFS
+				testHugepageInPod(f, l.root, &vsource, config)
+			})*/
+})
+
+func testHugepageInPod(
+	f *framework.Framework,
+	root string,
+	source *v1.VolumeSource,
+	config *storageframework.PerTestConfig,
+) {
+	pod := CreatePod(f, "hugepage-test", v1.PersistentVolumeFilesystem, source, config, false)
+	defer func() {
+		DeletePod(f, pod)
+	}()
+	testHugepage(f, pod, root, source)
+	DeletePod(f, pod)
+}
+
+func testHugepage(
+	f *framework.Framework,
+	pod *v1.Pod,
+	root string,
+	source *v1.VolumeSource,
+) {
+	ns := f.Namespace.Name
+	containerName := pod.Spec.Containers[0].Name
+
+	// run trace monitor on all workers
+	for worker := 1; ; worker++ {
+		sshcmd := fmt.Sprintf("%s/_work/%s/ssh.%d", os.Getenv("REPO_ROOT"), os.Getenv("CLUSTER"), worker)
+		if _, err := os.Stat(sshcmd); err == nil {
+			ssh := exec.Command(sshcmd, "sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/events/fs_dax/dax_pmd_fault_done/enable; echo 1 > /sys/kernel/debug/tracing/tracing_on; cat /sys/kernel/debug/tracing/trace_pipe > /tmp/tracetmp 2>&1 &'")
+			_, err = ssh.Output()
+			if err != nil {
+				framework.Failf("Failed to start pagefault tracing: %v", err)
+			}
+		} else {
+			// ssh wrapper does not exist: all nodes handled.
+			break
+		}
+	}
+
+	accessOutput, _ := pmempod.RunInPod(f, root, []string{accessHugepagesBinary}, "/tmp/"+path.Base(accessHugepagesBinary), ns, pod.Name, containerName)
+	By(fmt.Sprintf("Output from pmem-access-hugepages pod:[%s]", accessOutput))
+	for worker := 1; ; worker++ {
+		sshcmd := fmt.Sprintf("%s/_work/%s/ssh.%d", os.Getenv("REPO_ROOT"), os.Getenv("CLUSTER"), worker)
+		if _, err := os.Stat(sshcmd); err == nil {
+			ssh := exec.Command(sshcmd, "sudo sh -c 'echo 0 > /sys/kernel/debug/tracing/events/fs_dax/dax_pmd_fault_done/enable; echo 0 > /sys/kernel/debug/tracing/tracing_on; pkill -f cat\\ /sys/kernel/debug/tracing/trace_pipe'")
+			_, err = ssh.Output()
+			if err != nil {
+				framework.Failf("Failed to stop pagefault tracing: %v", err)
+			}
+
+			// There may be garbage (zero values) at start, we get better results by counting from end, thats why we use NF-relative fields in awk
+			ssh = exec.Command(sshcmd, "cat /tmp/tracetmp|awk '{print $(NF-13) $(NF-9)}'")
+			traceOutput, _ := ssh.Output()
+			if len(traceOutput) > 0 { // there was output from trace, get fault type
+				ssh := exec.Command(sshcmd, "cat /tmp/tracetmp|awk '{print $NF}'")
+				faultType, _ := ssh.Output()
+				By(fmt.Sprintf("Worker %d has tracer output: fault type:[%s] inode+addr:[%s]",
+					worker, strings.TrimSpace(string(faultType)), strings.TrimSpace(string(traceOutput))))
+
+				// Trace event NOPAGE means, hugepage fault happened. Trace event FALLBACK means, no page fault.
+				framework.ExpectEqual(strings.TrimSpace(string(faultType)), "NOPAGE", "page fault type has to be NOPAGE")
+				framework.ExpectEqual(accessOutput, strings.TrimSpace(string(traceOutput)), "mapped inode and addr must match traced values")
+				break
+			}
+		} else {
+			// ssh wrapper does not exist: all nodes handled.
+			// If we reach this break here instead of one above, no node had tracer output, this is not what we planned.
+			framework.Fail("No worker had trace output")
+			break
+		}
+	}
 }

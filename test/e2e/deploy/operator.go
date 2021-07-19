@@ -8,16 +8,19 @@ package deploy
 
 import (
 	"context"
+	"fmt"
 
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/kubernetes/test/e2e/framework"
 
 	"github.com/intel/pmem-csi/pkg/apis"
 	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1beta1"
+	cm "github.com/prometheus/client_model/go"
 
 	"github.com/onsi/gomega"
 )
@@ -170,4 +173,26 @@ func LogError(err error, format string, args ...interface{}) {
 	if err != nil {
 		framework.Logf(format, args...)
 	}
+}
+
+func GetOperatorMetricsURL(ctx context.Context, cluster *Cluster, d *Deployment) (string, error) {
+	urls, err := GetMetricsURLs(ctx, cluster, d.Namespace, labels.Set{
+		"pmem-csi.intel.com/deployment": d.Label(),
+		"app":                           "pmem-csi-operator",
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(urls) != 1 {
+		return "", fmt.Errorf("expected one metrics URL for operator, got: %v", urls)
+	}
+	return urls[0], nil
+}
+
+func GetOperatorMetrics(ctx context.Context, cluster *Cluster, d *Deployment) (map[string]*cm.MetricFamily, error) {
+	url, err := GetOperatorMetricsURL(ctx, cluster, d)
+	if err != nil {
+		return nil, err
+	}
+	return GetMetrics(ctx, cluster, url)
 }

@@ -18,8 +18,11 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	e2essh "k8s.io/kubernetes/test/e2e/framework/ssh"
 
+	"github.com/intel/pmem-csi/pkg/k8sutil"
+	"github.com/intel/pmem-csi/pkg/version"
 	. "github.com/onsi/gomega"
 )
 
@@ -27,12 +30,17 @@ type Cluster struct {
 	nodeIPs []string
 	cs      kubernetes.Interface
 	dc      dynamic.Interface
+	cfg     *rest.Config
+
+	version     *version.Version
+	isOpenShift bool
 }
 
-func NewCluster(cs kubernetes.Interface, dc dynamic.Interface) (*Cluster, error) {
+func NewCluster(cs kubernetes.Interface, dc dynamic.Interface, cfg *rest.Config) (*Cluster, error) {
 	cluster := &Cluster{
-		cs: cs,
-		dc: dc,
+		cs:  cs,
+		dc:  dc,
+		cfg: cfg,
 	}
 
 	hosts, err := e2essh.NodeSSHHosts(cs)
@@ -46,11 +54,25 @@ func NewCluster(cs kubernetes.Interface, dc dynamic.Interface) (*Cluster, error)
 		host := strings.Split(sshHost, ":")[0] // Instead of duplicating the NodeSSHHosts logic we simply strip the ssh port.
 		cluster.nodeIPs = append(cluster.nodeIPs, host)
 	}
+	version, err := k8sutil.GetKubernetesVersion(cfg)
+	if err != nil {
+		return nil, err
+	}
+	cluster.version = version
+	isOpenShift, err := k8sutil.IsOpenShift(cfg)
+	if err != nil {
+		return nil, err
+	}
+	cluster.isOpenShift = isOpenShift
 	return cluster, nil
 }
 
 func (c *Cluster) ClientSet() kubernetes.Interface {
 	return c.cs
+}
+
+func (c *Cluster) Config() *rest.Config {
+	return c.cfg
 }
 
 // NumNodes returns the total number of nodes in the cluster.
@@ -138,4 +160,10 @@ func (c *Cluster) WaitForDaemonSet(setName, namespace string) *appsv1.DaemonSet 
 
 func (c *Cluster) GetStatefulSet(ctx context.Context, setName, namespace string) (*appsv1.StatefulSet, error) {
 	return c.cs.AppsV1().StatefulSets(namespace).Get(ctx, setName, metav1.GetOptions{})
+}
+
+// StorageCapacitySupported checks that the v1beta1 CSIStorageCapacity API is supported.
+// It only checks the Kubernetes version.
+func (c *Cluster) StorageCapacitySupported() bool {
+	return c.version.Compare(1, 21) >= 0
 }

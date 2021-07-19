@@ -18,7 +18,9 @@ import (
 	"github.com/intel/pmem-csi/pkg/k8sutil"
 	"github.com/intel/pmem-csi/pkg/logger"
 	pmemcontroller "github.com/intel/pmem-csi/pkg/pmem-csi-operator/controller"
+	"github.com/intel/pmem-csi/pkg/pmem-csi-operator/metrics"
 	"github.com/intel/pmem-csi/pkg/version"
+	"github.com/operator-framework/operator-lib/handler"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,7 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
+	crhandler "sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -39,6 +41,8 @@ import (
 func init() {
 	// AddToManagerFuncs is a list of functions to create controllers and add them to a manager.
 	pmemcontroller.AddToManagerFuncs = append(pmemcontroller.AddToManagerFuncs, Add)
+
+	metrics.RegisterMetrics()
 }
 
 // Add creates a new Deployment Controller and adds it to the Manager. The Manager will set fields on the Controller
@@ -76,8 +80,8 @@ func add(ctx context.Context, mgr manager.Manager, r *ReconcileDeployment) error
 				return false
 			}
 
-			op := newObjectPatch(e.ObjectOld, e.ObjectNew)
-			data, err := op.diff()
+			patch := client.MergeFrom(e.ObjectOld)
+			data, err := patch.Data(e.ObjectNew)
 			if err != nil {
 				l.Error(err, "find deployment changes")
 				return true
@@ -107,7 +111,7 @@ func add(ctx context.Context, mgr manager.Manager, r *ReconcileDeployment) error
 	}
 
 	// Watch for changes to primary resource Deployment
-	if err := c.Watch(&source.Kind{Type: &api.PmemCSIDeployment{}}, &handler.EnqueueRequestForObject{}, p); err != nil {
+	if err := c.Watch(&source.Kind{Type: &api.PmemCSIDeployment{}}, &handler.InstrumentedEnqueueRequestForObject{}, p); err != nil {
 		return fmt.Errorf("watch: %v", err)
 	}
 
@@ -125,7 +129,7 @@ func add(ctx context.Context, mgr manager.Manager, r *ReconcileDeployment) error
 		// - check why "go test" does not cover this code
 		l.V(3).Info(what, "object", logger.KObjWithType(obj))
 		// Get the owned deployment
-		d, err := r.getDeploymentFor(obj)
+		d, err := r.getDeploymentFor(ctx, obj)
 		if err != nil {
 			l.V(3).Info("not owned by any deployment", "object", logger.KObjWithType(obj))
 			// The owner might have deleted already
@@ -164,7 +168,7 @@ func add(ctx context.Context, mgr manager.Manager, r *ReconcileDeployment) error
 	}
 
 	for _, resource := range currentObjects {
-		if err := c.Watch(&source.Kind{Type: resource}, &handler.EnqueueRequestForOwner{
+		if err := c.Watch(&source.Kind{Type: resource}, &crhandler.EnqueueRequestForOwner{
 			IsController: true,
 			OwnerType:    &api.PmemCSIDeployment{},
 		}, sop); err != nil {
@@ -212,7 +216,7 @@ func NewReconcileDeployment(ctx context.Context, client client.Client, opts pmem
 	ctx = logger.Set(ctx, l)
 
 	if opts.Namespace == "" {
-		opts.Namespace = k8sutil.GetNamespace()
+		opts.Namespace = k8sutil.GetNamespace(ctx)
 	}
 
 	if opts.DriverImage == "" {
@@ -316,10 +320,16 @@ func (r *ReconcileDeployment) Reconcile(ctx context.Context, request reconcile.R
 		}
 
 		l.V(3).Info("reconcile done", "duration", time.Since(startTime))
+		if err := metrics.SetReconcileMetrics(deployment.Name, string(deployment.UID)); err != nil {
+			l.V(3).Error(err, "failed to set reconcile metrics", "object", deployment)
+		}
 	}()
 
-	d := &pmemCSIDeployment{dep, r.namespace, r.k8sVersion, []byte{}}
-	if err := d.reconcile(ctx, r); err != nil {
+	d, err := r.newDeployment(ctx, dep)
+	if err == nil {
+		err = d.reconcile(ctx, r)
+	}
+	if err != nil {
 		l.Error(err, "reconcile failed")
 		dep.Status.Phase = api.DeploymentPhaseFailed
 		dep.Status.Reason = err.Error()
@@ -345,11 +355,15 @@ func (r *ReconcileDeployment) EventBroadcaster() record.EventBroadcaster {
 
 // AddHook adds given reconcile hook to hooks list
 func (r *ReconcileDeployment) AddHook(h ReconcileHook) {
+	r.reconcileMutex.Lock()
+	defer r.reconcileMutex.Unlock()
 	r.reconcileHooks[h] = struct{}{}
 }
 
 // RemoveHook removes previously added hook
 func (r *ReconcileDeployment) RemoveHook(h ReconcileHook) {
+	r.reconcileMutex.Lock()
+	defer r.reconcileMutex.Unlock()
 	delete(r.reconcileHooks, h)
 }
 
@@ -404,21 +418,68 @@ func (r *ReconcileDeployment) cacheDeploymentStatus(name string, status api.Depl
 	}
 }
 
-func (r *ReconcileDeployment) getDeploymentFor(obj metav1.Object) (*pmemCSIDeployment, error) {
+func (r *ReconcileDeployment) getDeploymentFor(ctx context.Context, obj metav1.Object) (*pmemCSIDeployment, error) {
 	r.deploymentsMutex.Lock()
 	defer r.deploymentsMutex.Unlock()
 	for _, d := range r.deployments {
 		selfRef := d.GetOwnerReference()
 		if isOwnedBy(obj, &selfRef) {
-			deployment := d.DeepCopy()
-			if err := deployment.EnsureDefaults(r.containerImage); err != nil {
-				return nil, err
-			}
-			return &pmemCSIDeployment{deployment, r.namespace, r.k8sVersion, []byte{}}, nil
+			// Don't modify the existing deployment, clone it first.
+			d := d.DeepCopy()
+			return r.newDeployment(ctx, d)
 		}
 	}
 
 	return nil, fmt.Errorf("Not found")
+}
+
+// newDeployment prepares for object creation and will modify the PmemCSIDeployment.
+// Callers who don't want that need to clone it first.
+func (r *ReconcileDeployment) newDeployment(ctx context.Context, deployment *api.PmemCSIDeployment) (*pmemCSIDeployment, error) {
+	l := logger.Get(ctx).WithName("newDeployment")
+
+	if err := deployment.EnsureDefaults(r.containerImage); err != nil {
+		return nil, err
+	}
+
+	d := &pmemCSIDeployment{
+		PmemCSIDeployment: deployment,
+		namespace:         r.namespace,
+		k8sVersion:        r.k8sVersion,
+	}
+
+	switch d.Spec.ControllerTLSSecret {
+	case "":
+		// Nothing to do.
+	case api.ControllerTLSSecretOpenshift:
+		// Nothing to load, we just add annotations.
+	default:
+		// Load the specified secret.
+		secret := &corev1.Secret{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "v1",
+				Kind:       "Secret",
+			},
+		}
+		objKey := client.ObjectKey{
+			Namespace: d.namespace,
+			Name:      d.Spec.ControllerTLSSecret,
+		}
+		if err := r.client.Get(ctx, objKey, secret); err != nil {
+			return nil, fmt.Errorf("loading ControllerTLSSecret %s from namespace %s: %v", d.Spec.ControllerTLSSecret, d.namespace, err)
+		}
+		ca, ok := secret.Data[api.TLSSecretCA]
+		if !ok {
+			return nil, fmt.Errorf("ControllerTLSSecret %s in namespace %s contains no %s", d.Spec.ControllerTLSSecret, d.namespace, api.TLSSecretCA)
+		}
+		d.controllerCABundle = ca
+		if len(d.controllerCABundle) == 0 {
+			return nil, fmt.Errorf("ControllerTLSSecret %s in namespace %s contains empty %s", d.Spec.ControllerTLSSecret, d.namespace, api.TLSSecretCA)
+		}
+		l.V(3).Info("load controller TLS secret", "secret", objKey, "CAlength", len(d.controllerCABundle))
+	}
+
+	return d, nil
 }
 
 // containerImage returns container image name used by operator Pod

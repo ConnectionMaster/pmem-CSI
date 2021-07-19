@@ -1,6 +1,7 @@
 package pmdmanager
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -10,14 +11,17 @@ import (
 	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1beta1"
 	pmemerr "github.com/intel/pmem-csi/pkg/errors"
 	pmemexec "github.com/intel/pmem-csi/pkg/exec"
+	pmemlog "github.com/intel/pmem-csi/pkg/logger"
 	"github.com/intel/pmem-csi/pkg/ndctl"
 	pmemcommon "github.com/intel/pmem-csi/pkg/pmem-common"
-	"k8s.io/klog/v2"
 )
 
 const (
 	// 4 MB alignment is used by LVM
 	lvmAlign uint64 = 4 * 1024 * 1024
+
+	// special alt name that a namespace must have to be managed by PMEM-CSI.
+	pmemCSINamespaceName = "pmem-csi"
 )
 
 type pmemLvm struct {
@@ -37,7 +41,9 @@ var vgsArgs = []string{"--noheadings", "--nosuffix", "-o", "vg_name,vg_size,vg_f
 var lvmMutex = &sync.Mutex{}
 
 // NewPmemDeviceManagerLVM Instantiates a new LVM based pmem device manager
-func newPmemDeviceManagerLVM(pmemPercentage uint) (PmemDeviceManager, error) {
+func newPmemDeviceManagerLVM(ctx context.Context, pmemPercentage uint) (PmemDeviceManager, error) {
+	ctx, logger := pmemlog.WithName(ctx, "LVM-New")
+
 	if pmemPercentage > 100 {
 		return nil, fmt.Errorf("invalid pmemPercentage '%d'. Value must be 0..100", pmemPercentage)
 	}
@@ -55,33 +61,33 @@ func newPmemDeviceManagerLVM(pmemPercentage uint) (PmemDeviceManager, error) {
 		for _, r := range bus.ActiveRegions() {
 			vgName := pmemcommon.VgName(bus, r)
 			if r.Type() != ndctl.PmemRegion {
-				klog.Infof("Region is not suitable for fsdax, skipping it: id = %q, device %q", r.ID(), r.DeviceName())
+				logger.Info("Region is not suitable for fsdax, skipping it", "id", r.ID(), "device", r.DeviceName())
 				continue
 			}
 
-			if err := setupNS(r, pmemPercentage); err != nil {
+			if err := setupNS(ctx, r, pmemPercentage); err != nil {
 				return nil, err
 			}
-			if err := setupVG(r, vgName); err != nil {
+			if err := setupVG(ctx, r, vgName); err != nil {
 				return nil, err
 			}
-			if _, err := pmemexec.RunCommand("vgs", vgName); err != nil {
-				klog.V(5).Infof("NewPmemDeviceManagerLVM: VG %v non-existent, skip", vgName)
+			if _, err := pmemexec.RunCommand(ctx, "vgs", vgName); err != nil {
+				logger.V(5).Info("Volume group non-existent, skipping it", "vg", vgName)
 			} else {
 				volumeGroups = append(volumeGroups, vgName)
 			}
 		}
 	}
 
-	return newPmemDeviceManagerLVMForVGs(volumeGroups)
+	return newPmemDeviceManagerLVMForVGs(ctx, volumeGroups)
 }
 
 func (pmem *pmemLvm) GetMode() api.DeviceMode {
 	return api.DeviceModeLVM
 }
 
-func newPmemDeviceManagerLVMForVGs(volumeGroups []string) (PmemDeviceManager, error) {
-	devices, err := listDevices(volumeGroups...)
+func newPmemDeviceManagerLVMForVGs(ctx context.Context, volumeGroups []string) (PmemDeviceManager, error) {
+	devices, err := listDevices(ctx, volumeGroups...)
 	if err != nil {
 		return nil, err
 	}
@@ -98,20 +104,22 @@ type vgInfo struct {
 	free uint64
 }
 
-func (lvm *pmemLvm) GetCapacity() (capacity Capacity, err error) {
+func (lvm *pmemLvm) GetCapacity(ctx context.Context) (capacity Capacity, err error) {
+	logger := pmemlog.Get(ctx).WithName("LVM-GetCapacity")
+	ctx = pmemlog.Set(ctx, logger)
+
 	lvmMutex.Lock()
 	defer lvmMutex.Unlock()
 
 	var vgs []vgInfo
-	vgs, err = getVolumeGroups(lvm.volumeGroups)
+	vgs, err = getVolumeGroups(ctx, lvm.volumeGroups)
 	if err != nil {
 		return
 	}
 
 	for _, vg := range vgs {
 		if vg.free > capacity.MaxVolumeSize {
-			// TODO: alignment?
-			capacity.MaxVolumeSize = vg.free
+			capacity.MaxVolumeSize = vg.free / lvmAlign * lvmAlign
 		}
 		capacity.Available += vg.free
 		capacity.Managed += vg.size
@@ -124,7 +132,9 @@ func (lvm *pmemLvm) GetCapacity() (capacity Capacity, err error) {
 	return capacity, nil
 }
 
-func (lvm *pmemLvm) CreateDevice(volumeId string, size uint64) error {
+func (lvm *pmemLvm) CreateDevice(ctx context.Context, volumeId string, size uint64) (uint64, error) {
+	ctx, logger := pmemlog.WithName(ctx, "LVM-CreateDevice")
+
 	lvmMutex.Lock()
 	defer lvmMutex.Unlock()
 	// Check that such volume does not exist. In certain error states, for example when
@@ -133,55 +143,58 @@ func (lvm *pmemLvm) CreateDevice(volumeId string, size uint64) error {
 	// Avoid device filling with garbage entries by returning error.
 	// Overall, no point having more than one namespace with same volumeId.
 	if _, err := lvm.getDevice(volumeId); err == nil {
-		return pmemerr.DeviceExists
+		return 0, pmemerr.DeviceExists
 	}
-	vgs, err := getVolumeGroups(lvm.volumeGroups)
+	vgs, err := getVolumeGroups(ctx, lvm.volumeGroups)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	// Adjust up to next alignment boundary, if not aligned already.
-	// This logic relies on size guaranteed to be nonzero,
-	// which is now achieved by check in upper layer.
-	// If zero size possible then we would need to check and increment by lvmAlign,
-	// because LVM does not tolerate creation of zero size.
-	if reminder := size % lvmAlign; reminder != 0 {
-		klog.V(5).Infof("CreateDevice align size up by %v: from %v", lvmAlign-reminder, size)
-		size += lvmAlign - reminder
-		klog.V(5).Infof("CreateDevice align size up: to %v", size)
+	actual := (size + lvmAlign - 1) / lvmAlign * lvmAlign
+	if actual == 0 {
+		actual = lvmAlign
 	}
-	strSz := strconv.FormatUint(size, 10) + "B"
+	if actual != size {
+		logger.V(3).Info("Increased size to satisfy LVM alignment",
+			"old-size", pmemlog.CapacityRef(int64(size)),
+			"new-size", pmemlog.CapacityRef(int64(actual)),
+			"alignment", pmemlog.CapacityRef(int64(lvmAlign)))
+	}
+	strSz := strconv.FormatUint(actual, 10) + "B"
 
 	for _, vg := range vgs {
 		// use first Vgroup with enough available space
-		if vg.free >= size {
+		if vg.free >= actual {
 			// In some container environments clearing device fails with race condition.
 			// So, we ask lvm not to clear(-Zn) the newly created device, instead we do ourself in later stage.
 			// lvcreate takes size in MBytes if no unit
-			if _, err := pmemexec.RunCommand("lvcreate", "-Zn", "-L", strSz, "-n", volumeId, vg.name); err != nil {
-				klog.V(3).Infof("lvcreate failed with error: %v, trying for next free region", err)
+			if _, err := pmemexec.RunCommand(ctx, "lvcreate", "-Zn", "-L", strSz, "-n", volumeId, vg.name); err != nil {
+				logger.V(3).Info("lvcreate failed with error, trying next free region", "error", err)
 			} else {
 				// clear start of device to avoid old data being recognized as file system
-				device, err := getUncachedDevice(volumeId, vg.name)
+				device, err := getUncachedDevice(ctx, volumeId, vg.name)
 				if err != nil {
-					return err
+					return 0, err
 				}
-				if err := waitDeviceAppears(device); err != nil {
-					return err
+				if err := waitDeviceAppears(ctx, device); err != nil {
+					return 0, err
 				}
-				if err := clearDevice(device, false); err != nil {
-					return fmt.Errorf("clear device %q: %v", volumeId, err)
+				if err := clearDevice(ctx, device, false); err != nil {
+					return 0, fmt.Errorf("clear device %q: %v", volumeId, err)
 				}
 
 				lvm.devices[device.VolumeId] = device
 
-				return nil
+				return actual, nil
 			}
 		}
 	}
-	return pmemerr.NotEnoughSpace
+	return 0, pmemerr.NotEnoughSpace
 }
 
-func (lvm *pmemLvm) DeleteDevice(volumeId string, flush bool) error {
+func (lvm *pmemLvm) DeleteDevice(ctx context.Context, volumeId string, flush bool) error {
+	ctx, _ = pmemlog.WithName(ctx, "LVM-DeleteDevice")
+
 	lvmMutex.Lock()
 	defer lvmMutex.Unlock()
 
@@ -194,7 +207,7 @@ func (lvm *pmemLvm) DeleteDevice(volumeId string, flush bool) error {
 		}
 		return err
 	}
-	if err := clearDevice(device, flush); err != nil {
+	if err := clearDevice(ctx, device, flush); err != nil {
 		if errors.Is(err, pmemerr.DeviceNotFound) {
 			// Remove device from cache
 			delete(lvm.devices, volumeId)
@@ -203,7 +216,7 @@ func (lvm *pmemLvm) DeleteDevice(volumeId string, flush bool) error {
 		return err
 	}
 
-	if _, err := pmemexec.RunCommand("lvremove", "-fy", device.Path); err != nil {
+	if _, err := pmemexec.RunCommand(ctx, "lvremove", "-fy", device.Path); err != nil {
 		return err
 	}
 
@@ -213,7 +226,7 @@ func (lvm *pmemLvm) DeleteDevice(volumeId string, flush bool) error {
 	return nil
 }
 
-func (lvm *pmemLvm) ListDevices() ([]*PmemDeviceInfo, error) {
+func (lvm *pmemLvm) ListDevices(ctx context.Context) ([]*PmemDeviceInfo, error) {
 	lvmMutex.Lock()
 	defer lvmMutex.Unlock()
 
@@ -225,7 +238,7 @@ func (lvm *pmemLvm) ListDevices() ([]*PmemDeviceInfo, error) {
 	return devices, nil
 }
 
-func (lvm *pmemLvm) GetDevice(volumeId string) (*PmemDeviceInfo, error) {
+func (lvm *pmemLvm) GetDevice(ctx context.Context, volumeId string) (*PmemDeviceInfo, error) {
 	lvmMutex.Lock()
 	defer lvmMutex.Unlock()
 
@@ -240,8 +253,8 @@ func (lvm *pmemLvm) getDevice(volumeId string) (*PmemDeviceInfo, error) {
 	return nil, pmemerr.DeviceNotFound
 }
 
-func getUncachedDevice(volumeId string, volumeGroup string) (*PmemDeviceInfo, error) {
-	devices, err := listDevices(volumeGroup)
+func getUncachedDevice(ctx context.Context, volumeId string, volumeGroup string) (*PmemDeviceInfo, error) {
+	devices, err := listDevices(ctx, volumeGroup)
 	if err != nil {
 		return nil, err
 	}
@@ -254,9 +267,9 @@ func getUncachedDevice(volumeId string, volumeGroup string) (*PmemDeviceInfo, er
 }
 
 // listDevices Lists available logical devices in given volume groups
-func listDevices(volumeGroups ...string) (map[string]*PmemDeviceInfo, error) {
+func listDevices(ctx context.Context, volumeGroups ...string) (map[string]*PmemDeviceInfo, error) {
 	args := append(lvsArgs, volumeGroups...)
-	output, err := pmemexec.RunCommand("lvs", args...)
+	output, err := pmemexec.RunCommand(ctx, "lvs", args...)
 	if err != nil {
 		return nil, fmt.Errorf("lvs failure : %v", err)
 	}
@@ -284,10 +297,12 @@ func parseLVSOutput(output string) (map[string]*PmemDeviceInfo, error) {
 	return devices, nil
 }
 
-func getVolumeGroups(groups []string) ([]vgInfo, error) {
+func getVolumeGroups(ctx context.Context, groups []string) ([]vgInfo, error) {
+	ctx, _ = pmemlog.WithName(ctx, "getVolumeGroups")
+
 	vgs := []vgInfo{}
 	args := append(vgsArgs, groups...)
-	output, err := pmemexec.RunCommand("vgs", args...)
+	output, err := pmemexec.RunCommand(ctx, "vgs", args...)
 	if err != nil {
 		return vgs, fmt.Errorf("vgs failure: %v", err)
 	}
@@ -306,61 +321,64 @@ func getVolumeGroups(groups []string) ([]vgInfo, error) {
 	return vgs, nil
 }
 
-const (
-	GB uint64 = 1024 * 1024 * 1024
-)
-
 // setupNS checks if a namespace needs to be created in the region and if so, does that.
-func setupNS(r *ndctl.Region, percentage uint) error {
-	align := GB
-	// In doc for "ndctl create-namespace" https://pmem.io/ndctl/ndctl-create-namespace.html
-	// it is stated that:
-	// For pmem namepsaces the size must be a multiple of the interleave-width and the namespace alignment.
-	// Because "align" is already used for argument we pass into r.CreateNamespace,
-	// we use "realalign" for multiplied alignment value required by above requirement.
-	realalign := align * r.InterleaveWays()
+func setupNS(ctx context.Context, r ndctl.Region, percentage uint) error {
+	ctx, logger := pmemlog.WithName(ctx, "setupNS")
 	canUse := uint64(percentage) * r.Size() / 100
-	klog.V(3).Infof("Create fsdax-namespaces in %v, allowed %d %%, real align %d:\ntotal       : %16d\navail       : %16d\ncan use     : %16d",
-		r.DeviceName(), percentage, realalign, r.Size(), r.AvailableSize(), canUse)
+	logger.V(3).Info("Checking region for fsdax namespaces",
+		"region", r.DeviceName(),
+		"percentage", percentage,
+		"size", pmemlog.CapacityRef(int64(r.Size())),
+		"available", pmemlog.CapacityRef(int64(r.AvailableSize())),
+		"max-available-extent", pmemlog.CapacityRef(int64(r.MaxAvailableExtent())),
+		"may-use", pmemlog.CapacityRef(int64(canUse)))
 	// Subtract sizes of existing active namespaces with currently handled mode and owned by pmem-csi
 	for _, ns := range r.ActiveNamespaces() {
-		klog.V(5).Infof("setupNS: Exists: Size %16d Mode:%v Device:%v Name:%v", ns.Size(), ns.Mode(), ns.DeviceName(), ns.Name())
-		if ns.Name() != "pmem-csi" {
+		logger.V(3).Info("Existing namespace",
+			"usable-size", pmemlog.CapacityRef(int64(ns.Size())),
+			"raw-size", pmemlog.CapacityRef(int64(ns.RawSize())),
+			"mode", ns.Mode(),
+			"device", ns.DeviceName(),
+			"name", ns.Name())
+		if ns.Name() != pmemCSINamespaceName {
 			continue
 		}
-		diff := int64(canUse - ns.Size())
-		if diff <= 0 {
+		used := ns.RawSize()
+		if used >= canUse {
+			logger.V(3).Info("All allowed space already in use by PMEM-CSI.")
 			canUse = 0
-		} else {
-			canUse = uint64(diff)
+			break
 		}
+		canUse -= used
 	}
-	klog.V(4).Infof("Calculated canUse:%v, available by Region info:%v", canUse, r.AvailableSize())
 	// Because of overhead by alignment and extra space for page mapping, calculated available may show more than actual
 	if r.AvailableSize() < canUse {
-		klog.V(4).Infof("Available in Region:%v is less than desired size, limit to that", r.AvailableSize())
+		logger.V(3).Info("Available space in region is less than desired size, limit to that",
+			"available", pmemlog.CapacityRef(int64(r.AvailableSize())))
 		canUse = r.AvailableSize()
 	}
 	// Should not happen often: fragmented space could lead to r.MaxAvailableExtent() being less than r.AvailableSize()
 	if r.MaxAvailableExtent() < canUse {
-		klog.V(4).Infof("MaxAvailableExtent in Region:%v is less than desired size, limit to that", r.MaxAvailableExtent())
+		logger.V(3).Info("Maximum namespace size in region is less than desired size due to fragmentation, limit to that",
+			"max-available-extent", pmemlog.CapacityRef(int64(r.MaxAvailableExtent())))
 		canUse = r.MaxAvailableExtent()
 	}
-	// Align down to next real alignment boundary, as trying creation above it may fail.
-	canUse /= realalign
-	canUse *= realalign
-	// If less than 2GB usable, don't attempt as creation would fail
-	minsize := 2 * GB
-	if canUse >= minsize {
-		klog.V(3).Infof("Create %v-bytes fsdax-namespace", canUse)
-		_, err := r.CreateNamespace(ndctl.CreateNamespaceOpts{
-			Name:  "pmem-csi",
-			Mode:  "fsdax",
-			Size:  canUse,
-			Align: align,
+	if canUse > 0 {
+		logger.V(3).Info("Create fsdax namespace", "size", pmemlog.CapacityRef(int64(canUse)))
+		ns, err := r.CreateNamespace(ctx, ndctl.CreateNamespaceOpts{
+			Name: "pmem-csi",
+			Mode: "fsdax",
+			Size: canUse,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to create PMEM namespace with size '%d' in region '%s': %v", canUse, r.DeviceName(), err)
+		}
+		// Wipe out any old filesystem or LVM signatures. Without this we might get
+		// duplicate volume groups when accidentally restoring a namespace that existed
+		// before and was used in a volume group. This is not idempotent, but hopefully
+		// it'll never fail or if it does, can be skipped when the driver tries again.
+		if _, err := pmemexec.RunCommand(ctx, "wipefs", "--all", "--force", "/dev/"+ns.BlockDeviceName()); err != nil {
+			return fmt.Errorf("failed to wipe new namespace: %v", err)
 		}
 	}
 
@@ -369,42 +387,61 @@ func setupNS(r *ndctl.Region, percentage uint) error {
 
 // setupVG ensures that all namespaces with name "pmem-csi" in the region
 // are part of the volume group.
-func setupVG(r *ndctl.Region, vgName string) error {
+func setupVG(ctx context.Context, r ndctl.Region, vgName string) error {
+	ctx, logger := pmemlog.WithName(ctx, "setupVG")
 	nsArray := r.ActiveNamespaces()
 	if len(nsArray) == 0 {
-		klog.V(3).Infof("No active namespaces in region %s", r.DeviceName())
+		logger.V(3).Info("No active namespaces, nothing to do", "region", r.DeviceName())
 		return nil
 	}
 	var devNames []string
 	for _, ns := range nsArray {
 		// consider only namespaces having name given by this driver, to exclude foreign ones
-		if ns.Name() == "pmem-csi" {
+		if ns.Name() == pmemCSINamespaceName {
 			devName := "/dev/" + ns.BlockDeviceName()
-			/* check if this pv is already part of a group, if yes ignore this pv
-			if not add to arg list */
-			output, err := pmemexec.RunCommand("pvs", "--noheadings", "-o", "vg_name", devName)
-			if err != nil || len(strings.TrimSpace(output)) == 0 {
-				devNames = append(devNames, devName)
-			}
+			devNames = append(devNames, devName)
 		}
 	}
 	if len(devNames) == 0 {
-		klog.V(3).Infof("no new namespace found to add to this group: %s", vgName)
+		logger.V(3).Info("No namespace found to add to the volume group", "vg", vgName)
+		return nil
+	}
+	return setupVGForNamespaces(ctx, vgName, devNames...)
+}
+
+// setupVGForNamespaces ensures that the given namespace are in the volume group,
+// creating it if necessary. Namespaces that are already in a group are ignored.
+func setupVGForNamespaces(ctx context.Context, vgName string, devNames ...string) error {
+	ctx, logger := pmemlog.WithName(ctx, "setupVGForNamespace")
+	var unusedDevNames []string
+	for _, devName := range devNames {
+		// check if this pv is already part of a group, if yes ignore
+		// this pv if not add to arg list
+		output, err := pmemexec.RunCommand(ctx, "pvs", "--noheadings", "-o", "vg_name", devName)
+		output = strings.TrimSpace(output)
+		if err != nil || len(output) == 0 {
+			unusedDevNames = append(unusedDevNames, devName)
+		} else {
+			logger.V(3).Info("Namespace already part of a volume group", "namespace", devName, "vg", output)
+		}
+	}
+	if len(unusedDevNames) == 0 {
+		logger.V(3).Info("No unused namespace found to add to the volume group", "vg", vgName)
 		return nil
 	}
 
 	cmd := ""
-	if _, err := pmemexec.RunCommand("vgdisplay", vgName); err != nil {
-		klog.V(3).Infof("No volume group with name %v, mark for creation", vgName)
+	if _, err := pmemexec.RunCommand(ctx, "vgdisplay", vgName); err != nil {
+		logger.V(3).Info("Creating new volume group", "vg", vgName)
 		cmd = "vgcreate"
 	} else {
-		klog.V(3).Infof("VolGroup '%v' exists", vgName)
+		logger.V(3).Info("Volume group exists, extending it", "vg", vgName)
 		cmd = "vgextend"
 	}
 
 	cmdArgs := []string{"--force", vgName}
-	cmdArgs = append(cmdArgs, devNames...)
-	_, err := pmemexec.RunCommand(cmd, cmdArgs...) //nolint gosec
+	cmdArgs = append(cmdArgs, unusedDevNames...)
+	_, err := pmemexec.RunCommand(ctx, cmd, cmdArgs...) //nolint gosec
 	if err != nil {
 		return fmt.Errorf("failed to create/extend volume group '%s': %v", vgName, err)
 	}

@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // DeviceMode type decleration for allowed driver device managers
@@ -73,6 +74,14 @@ const (
 	MutatePodsNever MutatePods = "Never"
 )
 
+const (
+	// ControllerTLSSecretOpenshift is a special string which
+	// enables the usage of
+	// https://docs.openshift.com/container-platform/4.6/security/certificates/service-serving-certificate.html
+	// to create certificates.
+	ControllerTLSSecretOpenshift = "-openshift-"
+)
+
 // +k8s:deepcopy-gen=true
 // DeploymentSpec defines the desired state of Deployment
 type DeploymentSpec struct {
@@ -96,8 +105,14 @@ type DeploymentSpec struct {
 	ControllerDriverResources *corev1.ResourceRequirements `json:"controllerDriverResources,omitempty"`
 	// ControllerTLSSecret is the name of a secret which contains ca.crt, tls.crt and tls.key data
 	// for the scheduler extender and pod mutation webhook. A controller is started if (and only if)
-	// this secret is specified.
+	// this secret is specified. The special string "-openshift-" enables the usage of
+	// https://docs.openshift.com/container-platform/4.6/security/certificates/service-serving-certificate.html
+	// to create certificates.
 	ControllerTLSSecret string `json:"controllerTLSSecret,omitempty"`
+	// ControllerReplicas determines how many copys of the controller Pod run concurrently.
+	// Zero (= unset) selects the builtin default, which is currently 1.
+	// +kubebuilder:validation:Minimum=0
+	ControllerReplicas int `json:"controllReplicas,omitempty"`
 	// MutatePod defines how a mutating pod webhook is configured if a controller
 	// is started. The field is ignored if the controller is not enabled.
 	// The default is "Try".
@@ -131,6 +146,10 @@ type DeploymentSpec struct {
 	Labels map[string]string `json:"labels,omitempty"`
 	// KubeletDir kubelet's root directory path
 	KubeletDir string `json:"kubeletDir,omitempty"`
+	// DaemonSets use the default RollingUpdate strategy with at most 1 node
+	// not having a running driver pod. That limit can be increased with
+	// this setting, either with a higher integer or a percentage.
+	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
 }
 
 // DeploymentConditionType type for representing a deployment status condition
@@ -261,56 +280,37 @@ const (
 	DefaultMutatePods = MutatePodsTry
 
 	// The sidecar versions must be kept in sync with the
-	// deploy/kustomize YAML files!
+	// deploy/kustomize YAML files! hack/bump-image-versions.sh
+	// can be used to update both.
 
-	// TODO: use released image
-	defaultProvisionerImageName = "gcr.io/k8s-staging-sig-storage/csi-provisioner"
-	defaultProvisionerImageTag  = "canary"
 	// DefaultProvisionerImage default external provisioner image to use
-	DefaultProvisionerImage = defaultProvisionerImageName + ":" + defaultProvisionerImageTag
+	DefaultProvisionerImage = "k8s.gcr.io/sig-storage/csi-provisioner:v2.2.2"
 
-	defaultRegistrarImageName = "k8s.gcr.io/sig-storage/csi-node-driver-registrar"
-	defaultRegistrarImageTag  = "v1.2.0"
 	// DefaultRegistrarImage default node driver registrar image to use
-	DefaultRegistrarImage = defaultRegistrarImageName + ":" + defaultRegistrarImageTag
+	DefaultRegistrarImage = "k8s.gcr.io/sig-storage/csi-node-driver-registrar:v2.2.0"
 
 	// Below resource requests and limits are derived(with minor adjustments) from
 	// recommendations reported by VirtualPodAutoscaler(LowerBound -> Requests and UpperBound -> Limits)
 
 	// DefaultControllerResourceRequestCPU default CPU resource request used for controller driver container
-	DefaultControllerResourceRequestCPU = "12m" // MilliSeconds
-
+	DefaultControllerResourceRequestCPU = "12m"
 	// DefaultControllerResourceRequestMemory default memory resource request used for controller driver container
-	DefaultControllerResourceRequestMemory = "128Mi" // MB
-	// DefaultNodeResourceRequestCPU default CPU resource request used for node driver container
-	DefaultNodeResourceRequestCPU = "100m" // MilliSeconds
-	// DefaultNodeResourceRequestMemory default memory resource request used for node driver container
-	DefaultNodeResourceRequestMemory = "250Mi" // MB
-	// DefaultNodeRegistrarRequestCPU default CPU resource request used for node registrar container
-	DefaultNodeRegistrarRequestCPU = "12m" // MilliSeconds
-	// DefaultNodeRegistrarRequestMemory default memory resource request used for node registrar container
-	DefaultNodeRegistrarRequestMemory = "128Mi" // MB
-	// DefaultProvisionerRequestCPU default CPU resource request used for provisioner container
-	DefaultProvisionerRequestCPU = "12m" // MilliSeconds
-	// DefaultProvisionerRequestMemory default memory resource request used for node registrar container
-	DefaultProvisionerRequestMemory = "128Mi" // MB
+	DefaultControllerResourceRequestMemory = "128Mi"
 
-	// DefaultControllerResourceLimitCPU default CPU resource limit used for controller driver container
-	DefaultControllerResourceLimitCPU = "500m" // MilliSeconds
-	// DefaultControllerResourceLimitMemory default memory resource limit used for controller driver container
-	DefaultControllerResourceLimitMemory = "250Mi" // MB
-	// DefaultNodeResourceLimitCPU default CPU resource limit used for node driver container
-	DefaultNodeResourceLimitCPU = "600m" // MilliSeconds
-	// DefaultNodeResourceLimitMemory default memory resource limit used for node driver container
-	DefaultNodeResourceLimitMemory = "500Mi" // MB
-	// DefaultNodeRegistrarLimitCPU default CPU resource limit used for node registrar container
-	DefaultNodeRegistrarLimitCPU = "100m" // MilliSeconds
-	// DefaultNodeRegistrarLimitMemory default memory resource limit used for node registrar container
-	DefaultNodeRegistrarLimitMemory = "128Mi" // MB
-	// DefaultProvisionerLimitCPU default CPU resource limit used for provisioner container
-	DefaultProvisionerLimitCPU = "250m" // MilliSeconds
-	// DefaultProvisionerLimitMemory default memory resource limit used for node registrar container
-	DefaultProvisionerLimitMemory = "250Mi" // MB
+	// DefaultNodeResourceRequestCPU default CPU resource request used for node driver container
+	DefaultNodeResourceRequestCPU = "100m"
+	// DefaultNodeResourceRequestMemory default memory resource request used for node driver container
+	DefaultNodeResourceRequestMemory = "250Mi"
+
+	// DefaultNodeRegistrarRequestCPU default CPU resource request used for node registrar container
+	DefaultNodeRegistrarRequestCPU = "12m"
+	// DefaultNodeRegistrarRequestMemory default memory resource request used for node registrar container
+	DefaultNodeRegistrarRequestMemory = "128Mi"
+
+	// DefaultProvisionerRequestCPU default CPU resource request used for provisioner container
+	DefaultProvisionerRequestCPU = "12m"
+	// DefaultProvisionerRequestMemory default memory resource request used for node registrar container
+	DefaultProvisionerRequestMemory = "128Mi"
 
 	// DefaultDeviceMode default device manger used for deployment
 	DefaultDeviceMode = DeviceModeLVM
@@ -441,10 +441,6 @@ func (d *PmemCSIDeployment) EnsureDefaults(operatorImage string) error {
 				corev1.ResourceCPU:    resource.MustParse(DefaultControllerResourceRequestCPU),
 				corev1.ResourceMemory: resource.MustParse(DefaultControllerResourceRequestMemory),
 			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse(DefaultControllerResourceLimitCPU),
-				corev1.ResourceMemory: resource.MustParse(DefaultControllerResourceLimitMemory),
-			},
 		}
 	}
 
@@ -453,10 +449,6 @@ func (d *PmemCSIDeployment) EnsureDefaults(operatorImage string) error {
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse(DefaultProvisionerRequestCPU),
 				corev1.ResourceMemory: resource.MustParse(DefaultProvisionerRequestMemory),
-			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse(DefaultProvisionerLimitCPU),
-				corev1.ResourceMemory: resource.MustParse(DefaultProvisionerLimitMemory),
 			},
 		}
 	}
@@ -467,10 +459,6 @@ func (d *PmemCSIDeployment) EnsureDefaults(operatorImage string) error {
 				corev1.ResourceCPU:    resource.MustParse(DefaultNodeResourceRequestCPU),
 				corev1.ResourceMemory: resource.MustParse(DefaultNodeResourceRequestMemory),
 			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse(DefaultNodeResourceLimitCPU),
-				corev1.ResourceMemory: resource.MustParse(DefaultNodeResourceLimitMemory),
-			},
 		}
 	}
 
@@ -479,10 +467,6 @@ func (d *PmemCSIDeployment) EnsureDefaults(operatorImage string) error {
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse(DefaultNodeRegistrarRequestCPU),
 				corev1.ResourceMemory: resource.MustParse(DefaultNodeRegistrarRequestMemory),
-			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse(DefaultNodeRegistrarLimitCPU),
-				corev1.ResourceMemory: resource.MustParse(DefaultNodeRegistrarLimitMemory),
 			},
 		}
 	}
@@ -496,6 +480,12 @@ func (d *PmemCSIDeployment) EnsureDefaults(operatorImage string) error {
 // name (like the CSIDriver object).
 func (d *PmemCSIDeployment) GetHyphenedName() string {
 	return strings.ReplaceAll(d.GetName(), ".", "-")
+}
+
+// ControllerTLSSecretOpenshiftName returns the name of the secret that
+// we want OpenShift to create for the controller service.
+func (d *PmemCSIDeployment) ControllerTLSSecretOpenshiftName() string {
+	return d.GetHyphenedName() + "-openshift-controller-tls"
 }
 
 // RegistrySecretName returns the name of the registry
@@ -516,22 +506,22 @@ func (d *PmemCSIDeployment) CSIDriverName() string {
 	return d.GetName()
 }
 
-// ControllerServiceName returns the name of the controller
-// Service object used by the deployment
-func (d *PmemCSIDeployment) ControllerServiceName() string {
-	return d.GetHyphenedName() + "-controller"
-}
-
 // MetricsServiceName returns the name of the controller metrics
 // Service object used by the deployment
 func (d *PmemCSIDeployment) MetricsServiceName() string {
 	return d.GetHyphenedName() + "-metrics"
 }
 
-// SchedulerServiceName returns the name of the controller's scheduler
-// Service object
+// SchedulerServiceName returns the name of the controller's
+// Service object for the scheduler extender.
 func (d *PmemCSIDeployment) SchedulerServiceName() string {
 	return d.GetHyphenedName() + "-scheduler"
+}
+
+// SchedulerServiceName returns the name of the controller's
+// Service object for the webhooks.
+func (d *PmemCSIDeployment) WebhooksServiceName() string {
+	return d.GetHyphenedName() + "-webhook"
 }
 
 // WebhooksServiceAccountName returns the name of the service account
@@ -576,6 +566,12 @@ func (d *PmemCSIDeployment) ProvisionerServiceAccountName() string {
 	return d.GetHyphenedName() + "-controller"
 }
 
+// ProvisionerRoleBindingName returns the name of the node driver's
+// RoleBinding object name for OpenShift
+func (d *PmemCSIDeployment) NodeOpenShiftRoleBindingName() string {
+	return d.GetHyphenedName() + "-node-openshift-cfg"
+}
+
 // ProvisionerRoleName returns the name of the provisioner's
 // RBAC Role object name used by the deployment
 func (d *PmemCSIDeployment) ProvisionerRoleName() string {
@@ -612,6 +608,30 @@ func (d *PmemCSIDeployment) ControllerDriverName() string {
 	return d.GetHyphenedName() + "-controller"
 }
 
+// NodeSetupServiceAccountName returns the name of the service account
+// used by the StatefulSet with the webhooks.
+func (d *PmemCSIDeployment) NodeSetupServiceAccountName() string {
+	return d.GetHyphenedName() + "-node-setup"
+}
+
+// NodeSetupClusterRoleName returns the name of the
+// webhooks' ClusterRole object name used by the deployment
+func (d *PmemCSIDeployment) NodeSetupClusterRoleName() string {
+	return d.GetHyphenedName() + "-node-setup-runner"
+}
+
+// NodeSetupClusterRoleBindingName returns the name of the
+// webhooks' ClusterRoleBinding object name used by the deployment
+func (d *PmemCSIDeployment) NodeSetupClusterRoleBindingName() string {
+	return d.GetHyphenedName() + "-node-setup-role"
+}
+
+// NodeSetupName returns the name of the node setup
+// DaemonSet object name used by the deployment
+func (d *PmemCSIDeployment) NodeSetupName() string {
+	return d.GetHyphenedName() + "-node-setup"
+}
+
 // GetOwnerReference returns self owner reference could be used by other object
 // to add this deployment to it's owner reference list.
 func (d *PmemCSIDeployment) GetOwnerReference() metav1.OwnerReference {
@@ -625,4 +645,12 @@ func (d *PmemCSIDeployment) GetOwnerReference() metav1.OwnerReference {
 		BlockOwnerDeletion: &blockOwnerDeletion,
 		Controller:         &isController,
 	}
+}
+
+// GetControllerReplicas returns a non-zero replica number for the controller.
+func (d *PmemCSIDeployment) GetControllerReplicas() int {
+	if d.Spec.ControllerReplicas <= 0 {
+		return 1
+	}
+	return d.Spec.ControllerReplicas
 }

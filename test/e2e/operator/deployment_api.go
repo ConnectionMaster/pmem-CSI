@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1beta1"
@@ -20,13 +21,13 @@ import (
 	"github.com/intel/pmem-csi/pkg/version"
 	"github.com/intel/pmem-csi/test/e2e/deploy"
 	"github.com/intel/pmem-csi/test/e2e/operator/validate"
+	"github.com/intel/pmem-csi/test/e2e/pod"
 
-	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
-	storagev1beta1 "k8s.io/api/storage/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,7 +38,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/kubernetes/test/e2e/framework"
-	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
 	runtime "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -45,9 +45,9 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-// We use intentionally use this non-existing driver image
+// We intentionally use this non-existing container registry for driver image
 // because these tests do not actually need a running driver.
-const dummyImage = "unexisting/pmem-csi-driver"
+const dummyImage = "127.0.0.1:270/unexisting/pmem-csi-driver"
 
 func getDeployment(name string) api.PmemCSIDeployment {
 	return api.PmemCSIDeployment{
@@ -66,13 +66,16 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 	return d.HasOperator && !d.HasDriver
 }, func(d *deploy.Deployment) {
 	var (
-		c          *deploy.Cluster
-		ctx        context.Context
-		cancel     func()
-		client     runtime.Client
-		k8sver     version.Version
-		evWatcher  watch.Interface
-		evCaptured map[types.UID]map[string]struct{}
+		c                  *deploy.Cluster
+		ctx                context.Context
+		cancel             func()
+		client             runtime.Client
+		k8sver             version.Version
+		evWatcher          watch.Interface
+		evWait             sync.WaitGroup
+		evCaptured         map[types.UID]map[string]struct{}
+		metricsURL         string
+		lastReconcileCount float64
 	)
 
 	f := framework.NewDefaultFramework("operator")
@@ -82,7 +85,7 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 
 	BeforeEach(func() {
 		Expect(f).ShouldNot(BeNil(), "framework init")
-		cluster, err := deploy.NewCluster(f.ClientSet, f.DynamicClient)
+		cluster, err := deploy.NewCluster(f.ClientSet, f.DynamicClient, f.ClientConfig())
 		Expect(err).ShouldNot(HaveOccurred(), "new cluster")
 		c = cluster
 
@@ -96,7 +99,10 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 		evWatcher, err = f.ClientSet.CoreV1().Events("").Watch(context.TODO(), metav1.ListOptions{})
 		Expect(err).ShouldNot(HaveOccurred(), "get events watcher")
 		evCaptured = map[types.UID]map[string]struct{}{}
+
+		evWait.Add(1)
 		go func() {
+			defer evWait.Done()
 			for watchEvent := range evWatcher.ResultChan() {
 				ev, ok := watchEvent.Object.(*corev1.Event)
 				if !ok || ev.Source.Component != "pmem-csi-operator" {
@@ -113,28 +119,31 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 		// We need to set up the global variables indirectly to avoid a warning about cancel not being called.
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Minute)
 		ctx, cancel = ctx2, cancel2
+
+		url, err := deploy.GetOperatorMetricsURL(ctx, c, d)
+		ExpectWithOffset(1, err).ShouldNot(HaveOccurred(), "get metrics url")
+		metricsURL = url
+
+		lastReconcileCount = 0
 	})
 
 	AfterEach(func() {
 		evWatcher.Stop()
+		// Wait till completion of event handler before
+		// making evCapture map to nil
+		evWait.Wait()
 		evCaptured = nil
 		cancel()
 	})
 
-	validateDriver := func(deployment api.PmemCSIDeployment, what ...interface{}) {
+	validateDriver := func(deployment api.PmemCSIDeployment, expectUpdates []runtime.Object, what ...interface{}) {
 		framework.Logf("waiting for expected driver deployment %s", deployment.Name)
 		if what == nil {
 			what = []interface{}{"validate driver"}
 		}
-
-		// We cannot check for unexpected object modifications
-		// by the operator during E2E testing because the app
-		// controllers themselves will also modify the same
-		// objects with status changes. We can only test
-		// that during unit testing.
-		initialCreation := false
-
-		framework.ExpectNoErrorWithOffset(1, validate.DriverDeploymentEventually(ctx, client, k8sver, d.Namespace, deployment, initialCreation), what...)
+		var err error
+		lastReconcileCount, err = validate.DriverDeploymentEventually(ctx, c, client, k8sver, metricsURL, d.Namespace, deployment, expectUpdates, lastReconcileCount)
+		framework.ExpectNoErrorWithOffset(1, err, what...)
 		framework.Logf("got expected driver deployment %s", deployment.Name)
 	}
 
@@ -159,16 +168,13 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 			expected[r] = struct{}{}
 		}
 		Eventually(func() bool {
-			reasons := map[string]struct{}{}
-			ok := false
-			if reasons, ok = evCaptured[dep.UID]; !ok {
+			reasons, ok := evCaptured[dep.UID]
+			if !ok {
 				// No event captured for this object
 				return false
 			}
 			for r := range reasons {
-				if _, ok := expected[r]; ok {
-					delete(expected, r)
-				}
+				delete(expected, r)
 			}
 			return len(expected) == 0
 		}, 2*time.Minute, time.Second, what, ": ", expected)
@@ -184,7 +190,7 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 	}
 
 	Context("deployment", func() {
-
+		percent := intstr.FromString("50%")
 		tests := map[string]api.PmemCSIDeployment{
 			"with defaults": getDeployment("test-deployment-with-defaults"),
 			"with explicit values": {
@@ -219,6 +225,7 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 							corev1.ResourceMemory: resource.MustParse("100Mi"),
 						},
 					},
+					MaxUnavailable: &percent,
 				},
 			},
 		}
@@ -228,7 +235,7 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 			It(name, func() {
 				deployment = deploy.CreateDeploymentCR(f, deployment)
 				defer deploy.DeleteDeploymentCR(f, deployment.Name)
-				validateDriver(deployment)
+				validateDriver(deployment, nil)
 				validateConditions(deployment.Name, map[api.DeploymentConditionType]corev1.ConditionStatus{
 					api.DriverDeployed: corev1.ConditionTrue,
 				})
@@ -252,13 +259,13 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 
 			deployment = deploy.CreateDeploymentCR(f, deployment)
 			defer deploy.DeleteDeploymentCR(f, deployment.Name)
-			validateDriver(deployment, "validate driver")
+			validateDriver(deployment, nil)
 
 			d := deploy.GetDeploymentCR(f, deployment.Name)
 
 			// Run in-cluster kubectl from master node
 			ssh := os.Getenv("REPO_ROOT") + "/_work/" + os.Getenv("CLUSTER") + "/ssh.0"
-			out, err := exec.RunCommand(ssh, "kubectl", "get", "pmemcsideployments.pmem-csi.intel.com", "--no-headers")
+			out, err := exec.RunCommand(ctx, ssh, "kubectl", "get", "pmemcsideployments.pmem-csi.intel.com", "--no-headers")
 			Expect(err).ShouldNot(HaveOccurred(), "kubectl get: %v", out)
 			Expect(out).Should(MatchRegexp(`%s\s+%s\s+.*"?%s"?:"?%s"?.*\s+%s\s+%s\s+[0-9]+(s|m)`,
 				d.Name, d.Spec.DeviceMode, lblKey, lblValue, d.Spec.Image, d.Status.Phase), "fields mismatch")
@@ -276,19 +283,19 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 
 			// operator image should be the driver image
 			deployment.Spec.Image = operatorPod.Spec.Containers[0].Image
-			validateDriver(deployment)
+			validateDriver(deployment, nil)
 		})
 
 		Context("logging format", func() {
 			cases := map[string]api.LogFormat{
 				"default": "",
 				"text":    api.LogFormatText,
-				"JSON":    api.LogFormatJSON,
+				"json":    api.LogFormatJSON,
 			}
 			for name, format := range cases {
 				format := format
 				It(name, func() {
-					deployment := getDeployment("test-deployment-driver-image")
+					deployment := getDeployment("test-logging-format-" + name)
 					deployment.Spec.Image = ""
 					deployment.Spec.PMEMPercentage = 50
 					deployment.Spec.LogFormat = format
@@ -297,15 +304,21 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 					deployment = deploy.CreateDeploymentCR(f, deployment)
 					defer deploy.DeleteDeploymentCR(f, deployment.Name)
 
-					validateDriver(deployment)
+					validateDriver(deployment, nil)
 
-					output, err := e2epod.GetPodLogs(f.ClientSet, d.Namespace, deployment.Name+"-controller-0", "pmem-driver")
-					framework.ExpectNoError(err, "get pod logs for controller-0")
+					controllerPod := c.WaitForAppInstance(labels.Set{
+						"app.kubernetes.io/component": "controller",
+					}, "" /* any instance */, d.Namespace)
+
+					deadline, cancel := context.WithTimeout(ctx, 5*time.Minute)
+					defer cancel()
+					output, err := pod.Logs(deadline, f.ClientSet, d.Namespace, controllerPod.Name, controllerPod.Spec.Containers[0].Name)
+					framework.ExpectNoError(err, "get controller pod logs for %s", controllerPod.Name)
 
 					if format == api.LogFormatJSON {
-						Expect(output).To(MatchRegexp(`\{"ts":\d+.\d+,"msg":"Version:`), "PMEM-CSI driver output in JSON")
+						Expect(output).To(MatchRegexp(`\{"ts":\d+.\d+,"msg":.*"version":`), "PMEM-CSI driver output in JSON")
 					} else {
-						Expect(output).To(MatchRegexp(`I.*main.go:.*Version: `), "PMEM-CSI driver output in glog format")
+						Expect(output).To(MatchRegexp(`I.*main.go:.*version="`), "PMEM-CSI driver output in glog format")
 					}
 					framework.Logf("got pod log: %s", output)
 				})
@@ -317,7 +330,7 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 
 			deployment = deploy.CreateDeploymentCR(f, deployment)
 			defer deploy.DeleteDeploymentCR(f, deployment.Name)
-			validateDriver(deployment, "validate driver before editing")
+			validateDriver(deployment, nil, "validate driver before editing")
 
 			// We have to get a fresh copy before updating it because the
 			// operator should have modified the status.
@@ -354,9 +367,32 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 				},
 			}
 
-			deployment = deploy.UpdateDeploymentCR(f, deployment)
+			// Expected sub-resource updates while reconcile the deployment changes
+			nodeSetupDS := appsv1.DaemonSet{}
+			err := client.Get(ctx, runtime.ObjectKey{
+				Name:      deployment.NodeSetupName(),
+				Namespace: d.Namespace,
+			}, &nodeSetupDS)
+			framework.ExpectNoError(err, "get node setup deemonset")
+			nodeSetupDS.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}
 
-			validateDriver(deployment, "validate driver after editing")
+			nodeDS := appsv1.DaemonSet{}
+			err = client.Get(ctx, runtime.ObjectKey{
+				Name:      deployment.NodeDriverName(),
+				Namespace: d.Namespace,
+			}, &nodeDS)
+			framework.ExpectNoError(err, "get node driver deemonset")
+			nodeDS.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}
+
+			controller := appsv1.Deployment{}
+			err = client.Get(ctx, runtime.ObjectKey{
+				Name:      deployment.ControllerDriverName(),
+				Namespace: d.Namespace,
+			}, &controller)
+			framework.ExpectNoError(err, "get controller deployment")
+			controller.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}
+			deployment = deploy.UpdateDeploymentCR(f, deployment)
+			validateDriver(deployment, []runtime.Object{&nodeSetupDS, &nodeDS, &controller}, "validate driver after editing")
 		})
 
 		It("shall allow multiple deployments", func() {
@@ -365,12 +401,14 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 
 			deployment1 = deploy.CreateDeploymentCR(f, deployment1)
 			defer deploy.DeleteDeploymentCR(f, deployment1.Name)
-			validateDriver(deployment1, "validate driver #1")
+			validateDriver(deployment1, nil, "validate driver #1")
 			validateEvents(&deployment1, []string{api.EventReasonNew, api.EventReasonRunning})
 
 			deployment2 = deploy.CreateDeploymentCR(f, deployment2)
 			defer deploy.DeleteDeploymentCR(f, deployment2.Name)
-			validateDriver(deployment2, true /* TODO 2 */, "validate driver #2")
+			// reset reconcile count for the new deployment
+			lastReconcileCount = 0
+			validateDriver(deployment2, nil, "validate driver #2")
 			validateEvents(&deployment2, []string{api.EventReasonNew, api.EventReasonRunning})
 		})
 
@@ -379,14 +417,14 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 
 			deployment1 = deploy.CreateDeploymentCR(f, deployment1)
 			defer deploy.DeleteDeploymentCR(f, deployment1.Name)
-			validateDriver(deployment1, "validate driver")
+			validateDriver(deployment1, nil)
 		})
 
 		It("shall be able to use custom CA certificates", func() {
 			deployment := getDeployment("test-deployment-with-certificates")
 			deployment = deploy.CreateDeploymentCR(f, deployment)
 			defer deploy.DeleteDeploymentCR(f, deployment.Name)
-			validateDriver(deployment, true)
+			validateDriver(deployment, nil)
 			validateConditions(deployment.Name, map[api.DeploymentConditionType]corev1.ConditionStatus{
 				api.DriverDeployed: corev1.ConditionTrue,
 			})
@@ -399,7 +437,7 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 			deployment = deploy.CreateDeploymentCR(f, deployment)
 
 			defer deploy.DeleteDeploymentCR(f, deployment.Name)
-			validateDriver(deployment, true)
+			validateDriver(deployment, nil, "before operator restart")
 			validateConditions(deployment.Name, map[api.DeploymentConditionType]corev1.ConditionStatus{
 				api.DriverDeployed: corev1.ConditionTrue,
 			})
@@ -407,17 +445,16 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 			// Stop the operator
 			stopOperator(c, d)
 			// restore the deployment so that next test should  not effect
-			defer startOperator(c, d)
+			defer func() {
+				startOperator(c, d)
+				url, err := deploy.GetOperatorMetricsURL(ctx, c, d)
+				Expect(err).ShouldNot(HaveOccurred(), "get metrics url after operator restart")
+				metricsURL = url
+			}()
 
 			// Ensure that the driver is running consistently
-			resourceVersions := map[string]string{}
-			Consistently(func() error {
-				final, err := validate.DriverDeployment(client, k8sver, d.Namespace, deployment, resourceVersions)
-				if final {
-					framework.Failf("final error during driver validation after restarting: %v", err)
-				}
-				return err
-			}, "1m", "20s").ShouldNot(HaveOccurred(), "driver validation failure after restarting")
+			err := validate.DriverDeployment(ctx, client, k8sver, d.Namespace, deployment)
+			Expect(err).ShouldNot(HaveOccurred(), "after operator restart")
 		})
 
 		It("shall recover from conflicts", func() {
@@ -466,8 +503,14 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 
 			// Deleting the existing service should make the deployment succeed.
 			deleteService()
-			validateDriver(deployment, true)
+			Eventually(func() bool {
+				out := deploy.GetDeploymentCR(f, deployment.Name)
+				return out.Status.Phase == api.DeploymentPhaseRunning
+			}, "3m", "1s").Should(BeTrue(), "after resolved conflicts")
 			validateEvents(&deployment, []string{api.EventReasonNew, api.EventReasonRunning})
+
+			err := validate.DriverDeployment(ctx, client, k8sver, d.Namespace, deployment)
+			framework.ExpectNoError(err, "validate driver after resolved conflicts")
 		})
 
 		It("shall recover from missing secret", func() {
@@ -512,8 +555,15 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 				return err
 			}, "3m", "1s").ShouldNot(HaveOccurred(), "create secret %s", sec.Name)
 			defer deleteSecret()
-			validateDriver(deployment, true)
+			// Now as the missing secrets are there in place, the deployment should
+			// move ahead and get succeed
+			Eventually(func() bool {
+				deployment := deploy.GetDeploymentCR(f, deployment.Name)
+				return deployment.Status.Phase == api.DeploymentPhaseRunning
+			}, "3m", "1s").Should(BeTrue(), "deployment should not fail %q", deployment.Name)
 			validateEvents(&deployment, []string{api.EventReasonNew, api.EventReasonRunning})
+			err := validate.DriverDeployment(context.Background(), client, k8sver, d.Namespace, deployment)
+			Expect(err).ShouldNot(HaveOccurred(), "validate driver after secret creation")
 		})
 	})
 
@@ -588,7 +638,7 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 				// Delete Volume created in `from` device mode
 				deletePVC(f, pvc.Namespace, pvc.Name)
 			},
-			"use volume": func(from, to api.DeviceMode, depName string, pvc *corev1.PersistentVolumeClaim) {
+			"use volume in same mode": func(from, to api.DeviceMode, depName string, pvc *corev1.PersistentVolumeClaim) {
 				// Switch back to original device mode
 				switchDeploymentMode(c, f, depName, d.Namespace, from)
 
@@ -611,6 +661,7 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 					postSwitch := postSwitch
 					It(name, func() {
 						driverName := ctx + "-" + strings.Replace(name, " ", "-", -1)
+						percent100 := intstr.FromString("100%")
 						deployment := api.PmemCSIDeployment{
 							ObjectMeta: metav1.ObjectMeta{
 								Name: driverName,
@@ -622,17 +673,14 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 									// Provided by NFD.
 									"feature.node.kubernetes.io/memory-nv.dax": "true",
 								},
+								// Speed up restarts by doing it on all nodes in parallel.
+								MaxUnavailable: &percent100,
 							},
 						}
 
 						deployment = deploy.CreateDeploymentCR(f, deployment)
 						defer deploy.DeleteDeploymentCR(f, deployment.Name)
-						deploy.WaitForPMEMDriver(c,
-							&deploy.Deployment{
-								Namespace:  d.Namespace,
-								DriverName: driverName,
-							})
-						validateDriver(deployment, true)
+						validateDriver(deployment, nil, "validate driver")
 
 						// NOTE(avalluri): As the current operator does not support deploying
 						// the driver in 'testing' mode, we cannot directely access CSI
@@ -675,9 +723,10 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 		for _, testcase := range testcases.UpdateTests() {
 			testcase := testcase
 			Context(testcase.Name, func() {
-				testIt := func(restart bool) {
+				testIt := func(name string, restart bool) {
 					deployment := *testcase.Deployment.DeepCopyObject().(*api.PmemCSIDeployment)
 
+					deployment.Name = deployment.Name + "-" + name
 					// Use fake images to prevent pods from actually starting.
 					deployment.Spec.Image = dummyImage
 					deployment.Spec.NodeRegistrarImage = dummyImage
@@ -685,7 +734,7 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 
 					deployment = deploy.CreateDeploymentCR(f, deployment)
 					defer deploy.DeleteDeploymentCR(f, deployment.Name)
-					validateDriver(deployment, "validate driver before update")
+					validateDriver(deployment, nil, "validate driver before update")
 
 					// We have to get a fresh copy before updating it because the
 					// operator should have modified the status, and only the status.
@@ -693,12 +742,18 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 					Expect(modifiedDeployment.Spec).To(Equal(deployment.Spec), "spec unmodified")
 					Expect(modifiedDeployment.Status.Phase).To(Equal(api.DeploymentPhaseRunning), "deployment phase")
 
+					resetMetricsURL := func() {
+						url, err := deploy.GetOperatorMetricsURL(ctx, c, d)
+						Expect(err).ShouldNot(HaveOccurred(), "get metrics url after operator restart")
+						metricsURL = url
+					}
 					restored := false
 					if restart {
 						stopOperator(c, d)
 						defer func() {
 							if !restored {
 								startOperator(c, d)
+								resetMetricsURL()
 							}
 						}()
 					}
@@ -706,20 +761,26 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 					testcase.Mutate(&modifiedDeployment)
 					deployment = deploy.UpdateDeploymentCR(f, modifiedDeployment)
 
+					reconcileCount := lastReconcileCount
 					if restart {
 						startOperator(c, d)
+						resetMetricsURL()
 						restored = true
+						reconcileCount = float64(0)
 					}
 
-					validateDriver(modifiedDeployment, "validate driver after update and restart")
+					_, err := validate.WaitForDeploymentReconciled(ctx, c, metricsURL, deployment, reconcileCount)
+					Expect(err).ShouldNot(HaveOccurred(), "reconcile after operator restart")
+					err = validate.DriverDeployment(ctx, client, k8sver, d.Namespace, deployment)
+					Expect(err).ShouldNot(HaveOccurred(), "validate driver after update and restart")
 				}
 
 				It("while running", func() {
-					testIt(false)
+					testIt("while-running", false)
 				})
 
 				It("while stopped", func() {
-					testIt(true)
+					testIt("while-stopped", true)
 				})
 			})
 		}
@@ -743,16 +804,6 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 						ObjectMeta: metav1.ObjectMeta{Name: dep.SchedulerServiceName(), Namespace: d.Namespace},
 					}
 				},
-				"controller service": func(dep *api.PmemCSIDeployment) runtime.Object {
-					return &corev1.Service{
-						ObjectMeta: metav1.ObjectMeta{Name: dep.ControllerServiceName(), Namespace: d.Namespace},
-					}
-				},
-				"metrics service": func(dep *api.PmemCSIDeployment) runtime.Object {
-					return &corev1.Service{
-						ObjectMeta: metav1.ObjectMeta{Name: dep.MetricsServiceName(), Namespace: d.Namespace},
-					}
-				},
 				"webhooks role": func(dep *api.PmemCSIDeployment) runtime.Object {
 					return &rbacv1.Role{
 						ObjectMeta: metav1.ObjectMeta{Name: dep.WebhooksRoleName(), Namespace: d.Namespace},
@@ -774,7 +825,7 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 					}
 				},
 				"mutating webhook config": func(dep *api.PmemCSIDeployment) runtime.Object {
-					return &admissionregistrationv1beta1.MutatingWebhookConfiguration{
+					return &admissionregistrationv1.MutatingWebhookConfiguration{
 						ObjectMeta: metav1.ObjectMeta{Name: dep.MutatingWebhookName()},
 					}
 				},
@@ -799,12 +850,12 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 					}
 				},
 				"csi driver": func(dep *api.PmemCSIDeployment) runtime.Object {
-					return &storagev1beta1.CSIDriver{
+					return &storagev1.CSIDriver{
 						ObjectMeta: metav1.ObjectMeta{Name: dep.GetName()},
 					}
 				},
 				"controller driver": func(dep *api.PmemCSIDeployment) runtime.Object {
-					return &appsv1.StatefulSet{
+					return &appsv1.Deployment{
 						ObjectMeta: metav1.ObjectMeta{Name: dep.ControllerDriverName(), Namespace: d.Namespace},
 					}
 				},
@@ -834,12 +885,13 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 					dep.Spec.MutatePods = api.MutatePodsAlways
 					deployment := deploy.CreateDeploymentCR(f, dep)
 					defer deploy.DeleteDeploymentCR(f, dep.Name)
-					validateDriver(deployment)
+					validateDriver(deployment, nil)
 
 					obj := getter(&dep)
 					delete(obj)
 					ensureObjectRecovered(obj)
-					validateDriver(deployment, "restore deleted registry secret")
+					err := validate.DriverDeployment(ctx, client, k8sver, d.Namespace, deployment)
+					Expect(err).ShouldNot(HaveOccurred(), "validate driver after object recover")
 				})
 			}
 		})
@@ -847,11 +899,11 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 		Context("conflicting update", func() {
 			tests := map[string]func(dep *api.PmemCSIDeployment) runtime.Object{
 				"controller": func(dep *api.PmemCSIDeployment) runtime.Object {
-					obj := &appsv1.StatefulSet{}
+					obj := &appsv1.Deployment{}
 					key := runtime.ObjectKey{Name: dep.ControllerDriverName(), Namespace: d.Namespace}
 					EventuallyWithOffset(1, func() error {
 						return client.Get(context.TODO(), key, obj)
-					}, "2m", "1s").ShouldNot(HaveOccurred(), "get stateful set")
+					}, "2m", "1s").ShouldNot(HaveOccurred(), "get deployment")
 
 					for i, container := range obj.Spec.Template.Spec.Containers {
 						if container.Name == "pmem-driver" {
@@ -876,39 +928,6 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 					}
 					return obj
 				},
-				"metrics service": func(dep *api.PmemCSIDeployment) runtime.Object {
-					obj := &corev1.Service{}
-					key := runtime.ObjectKey{Name: dep.MetricsServiceName(), Namespace: d.Namespace}
-					EventuallyWithOffset(1, func() error {
-						return client.Get(context.TODO(), key, obj)
-					}, "2m", "1s").ShouldNot(HaveOccurred(), "get metrics service set")
-					obj.Spec.Ports = []corev1.ServicePort{
-						{
-							Port: 1111,
-							TargetPort: intstr.IntOrString{
-								IntVal: 1111,
-							},
-						},
-					}
-					return obj
-				},
-				"controller service": func(dep *api.PmemCSIDeployment) runtime.Object {
-					obj := &corev1.Service{}
-					key := runtime.ObjectKey{Name: dep.ControllerServiceName(), Namespace: d.Namespace}
-					EventuallyWithOffset(1, func() error {
-						return client.Get(context.TODO(), key, obj)
-					}, "2m", "1s").ShouldNot(HaveOccurred(), "get metrics service set")
-
-					obj.Spec.Ports = []corev1.ServicePort{
-						{
-							Port: 1111,
-							TargetPort: intstr.IntOrString{
-								IntVal: 1111,
-							},
-						},
-					}
-					return obj
-				},
 			}
 			for name, mutate := range tests {
 				name, mutate := name, mutate
@@ -917,9 +936,10 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 					dep.Spec.ControllerTLSSecret = "pmem-csi-intel-com-controller-secret"
 					deployment := deploy.CreateDeploymentCR(f, dep)
 					defer deploy.DeleteDeploymentCR(f, dep.Name)
-					validateDriver(deployment)
+					validateDriver(deployment, nil, "validate before conflicts")
 
 					obj := mutate(&deployment)
+
 					Eventually(func() error {
 						err := client.Update(context.TODO(), obj)
 						if err != nil && errors.IsConflict(err) {
@@ -928,7 +948,9 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 						return err
 					}, "2m", "1s").ShouldNot(HaveOccurred(), "update: %s", name)
 
-					validateDriver(deployment, fmt.Sprintf("recovered %s", name))
+					Eventually(func() error {
+						return validate.DriverDeployment(ctx, client, k8sver, d.Namespace, deployment)
+					}, "2m", "1s").ShouldNot(HaveOccurred(), fmt.Sprintf("recovered %s", name))
 				})
 			}
 		})
@@ -975,7 +997,7 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 							}
 							// Zero is actually a valid value: it is treated as "unset" because of
 							// the JSON omitempty and thus means "I want the default".
-							valid := percentage >= 0 && percentage <= 100
+							valid := percentage <= 100
 							if valid {
 								framework.ExpectNoError(err, "valid percentage should work")
 							} else {
@@ -1038,19 +1060,6 @@ var _ = deploy.DescribeForSome("API", func(d *deploy.Deployment) bool {
 		}
 	})
 })
-
-func validateDeploymentFailure(f *framework.Framework, name string) {
-	Eventually(func() bool {
-		dep, err := f.DynamicClient.Resource(deploy.DeploymentResource).Get(context.Background(), name, metav1.GetOptions{})
-		if err != nil {
-			return false
-		}
-
-		deployment := deploy.DeploymentFromUnstructured(dep)
-		framework.Logf("Deployment %q is in %q phase", deployment.Name, deployment.Status.Phase)
-		return deployment.Status.Phase == api.DeploymentPhaseFailed
-	}, "3m", "5s").Should(BeTrue(), "deployment %q not running", name)
-}
 
 // stopOperator ensures operator deployment replica counter == 0 and the
 // operator pod gets deleted
@@ -1135,23 +1144,27 @@ func switchDeploymentMode(c *deploy.Cluster, f *framework.Framework, depName, ns
 	deployment.Spec.DeviceMode = mode
 	deployment = deploy.UpdateDeploymentCR(f, deployment)
 
-	// Wait till all the existing daemonset pods restarted
-	for _, pod := range podNames {
-		Eventually(func() bool {
+	// Wait till all the existing daemonset pods are deleted.
+	Eventually(func() []string {
+		var runningPods []string
+		for _, pod := range podNames {
 			_, err := f.ClientSet.CoreV1().Pods(ns).Get(context.Background(), pod, metav1.GetOptions{})
 			if err != nil && errors.IsNotFound(err) {
-				return true
+				continue
 			}
-			deploy.LogError(err, "Failed to fetch daemon set: %v", err)
-			return false
-		}, "3m", "1s").Should(BeTrue(), "Pod restart '%s'", pod)
-	}
+			deploy.LogError(err, "Failed to fetch pod: %v", err)
+			runningPods = append(runningPods, pod)
+		}
+		return runningPods
+	}, "3m", "5s").Should(BeEmpty(), "all DaemonSet pods deleted")
 
 	deploy.WaitForPMEMDriver(c,
 		&deploy.Deployment{
 			Namespace:  ns,
 			DriverName: depName,
-		})
+		},
+		1, /* controller replicas */
+	)
 
 	return deployment
 }
@@ -1212,7 +1225,7 @@ func createPVC(f *framework.Framework, namespace, name, storageClassName string)
 			},
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse("2Gi"),
+					corev1.ResourceStorage: resource.MustParse("100Mi"),
 				},
 			},
 		},

@@ -7,14 +7,15 @@ SPDX-License-Identifier: Apache-2.0
 package pmemcsidriver
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"sync"
 
-	"github.com/intel/pmem-csi/pkg/pmem-grpc"
+	pmemlog "github.com/intel/pmem-csi/pkg/logger"
+	pmemgrpc "github.com/intel/pmem-csi/pkg/pmem-grpc"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
 	"google.golang.org/grpc"
-	"k8s.io/klog/v2"
 )
 
 type Service interface {
@@ -33,11 +34,11 @@ func NewNonBlockingGRPCServer() *NonBlockingGRPCServer {
 	return &NonBlockingGRPCServer{}
 }
 
-func (s *NonBlockingGRPCServer) Start(endpoint string, tlsConfig *tls.Config, csiMetricsManager metrics.CSIMetricsManager, services ...Service) error {
+func (s *NonBlockingGRPCServer) Start(ctx context.Context, endpoint, errorPrefix string, tlsConfig *tls.Config, csiMetricsManager metrics.CSIMetricsManager, services ...Service) error {
 	if endpoint == "" {
 		return fmt.Errorf("endpoint cannot be empty")
 	}
-	rpcServer, l, err := pmemgrpc.NewServer(endpoint, tlsConfig, csiMetricsManager)
+	rpcServer, l, err := pmemgrpc.NewServer(endpoint, errorPrefix, tlsConfig, csiMetricsManager)
 	if err != nil {
 		return nil
 	}
@@ -46,14 +47,15 @@ func (s *NonBlockingGRPCServer) Start(endpoint string, tlsConfig *tls.Config, cs
 	}
 	s.servers = append(s.servers, rpcServer)
 
+	logger := pmemlog.Get(ctx).WithName("GRPC-server").WithValues("endpoint", endpoint)
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		klog.V(3).Infof("Listening for connections on address: %v", l.Addr())
+		logger.V(3).Info("Listening for connections")
 		if err := rpcServer.Serve(l); err != nil {
-			klog.Errorf("Server Listen failure: %s", err.Error())
+			logger.Error(err, "Listen failure")
 		}
-		klog.V(3).Infof("Server on '%s' stopped", endpoint)
+		logger.V(3).Info("Stopped")
 	}()
 
 	return nil

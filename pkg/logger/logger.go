@@ -19,7 +19,7 @@ package logger
 import (
 	"context"
 
-	"github.com/intel/pmem-csi/pkg/logger/klogr"
+	"k8s.io/klog/v2/klogr"
 
 	"github.com/go-logr/logr"
 )
@@ -36,5 +36,12 @@ func Get(ctx context.Context) logr.Logger {
 	if l != nil {
 		return l
 	}
-	return klogr.New()
+	return klogr.NewWithOptions(klogr.WithFormat(klogr.FormatKlog))
+}
+
+// WithName updates the logger in the context and returns the new logger and context.
+func WithName(ctx context.Context, name string) (context.Context, logr.Logger) {
+	logger := Get(ctx).WithName(name)
+	ctx = Set(ctx, logger)
+	return ctx, logger
 }

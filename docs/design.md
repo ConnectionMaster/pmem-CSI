@@ -1,17 +1,5 @@
 # Design and architecture
 
-- [Design](#design)
-    - [Architecture and Operation](#architecture-and-operation)
-    - [LVM device mode](#lvm-device-mode)
-    - [Direct device mode](#direct-device-mode)
-    - [Kata Containers support](#kata-containers-support)
-    - [Dynamic provisioning of local volumes](#dynamic-provisioning-of-local-volumes)
-    - [Communication between components](#communication-between-components)
-    - [Security](#security)
-    - [Volume Persistency](#volume-persistency)
-    - [Capacity-aware pod scheduling](#capacity-aware-pod-scheduling)
-    - [PMEM-CSI operator](#pmem-csi-operator)
-        
 ## Architecture and Operation
 
 The PMEM-CSI driver can operate in two different device modes: *LVM* and
@@ -28,6 +16,7 @@ There is a more detailed explanation in the following paragraphs.
 | *Name* field in namespace | *Name* gets set to 'pmem-csi' to achieve own vs. foreign marking | *Name* gets set to VolumeID, without attempting own vs. foreign marking  |
 |Minimum volume size| 4 MB                   | 1 GB (see also alignment adjustment below) |
 |Alignment requirements |LVM creation aligns size up to next 4MB boundary  |driver aligns  size up to next alignment boundary. The default alignment step is 1 GB. Device(s) in interleaved mode will require larger minimum as size has to be at least one alignment step. The possibly bigger alignment step is calculated as interleave-set-size multiplied by 1 GB |
+|Huge pages supported<sup>4</sup> | maybe| yes|
 
 <sup>1 </sup> **Free space fragmentation** is a problem when there appears to
 be enough free capacity for a new namespace, but there isn't a contiguous
@@ -55,6 +44,13 @@ Programming](https://pmem.io/ndctl/ndctl-create-namespace.html) for
 details. `devdax` mode is not supported. Though a
 raw block volume would be useful when a filesystem isn't needed, Kubernetes
 cannot handle [binding a character device to a loop device](https://github.com/kubernetes/kubernetes/blob/7c87b5fb55ca096c007c8739d4657a5a4e29fb09/pkg/volume/util/util.go#L531-L534).
+
+<sup>4 </sup> **Huge pages supported**: ext4 and XFS filesystems are created using the options that should enable huge
+ page support, as explained in section "Verifying IO Alignment" in
+ ["Using Persistent Memory Devices with the Linux Device Mapper"](https://pmem.io/2018/05/15/using_persistent_memory_devices_with_the_linux_device_mapper.html).
+[Testing that support by observing page faults](/test/cmd/pmem-access-hugepages/main.go) confirmed that
+this worked for direct mode. It did not work for LVM mode in the QEMU virtual machines, but it cannot be
+ruled out that it works elsewhere.
 
 ## LVM device mode
 
@@ -169,13 +165,26 @@ provisioning"](https://github.com/kubernetes-csi/external-provisioner/tree/v2.1.
   for first consumer"), a volume is tentatively assigned to a node
   before creating it, in which case the `external-provisioner` running
   on that node can tell that it is responsible for provisioning.
+- The scheduler extensions help the scheduler with picking nodes where
+  volumes can be created. Without them, the risk of choosing nodes
+  without PMEM may be too high and manual pod scheduling may be needed
+  to avoid long delays when starting pods. Starting with
+  Kubernetes 1.21, [storage capacity
+  tracking](https://kubernetes.io/docs/concepts/storage/storage-capacity/)
+  is used to solve this problem and the scheduler extensions are not
+  needed anymore.
 - For volumes with storage classes that use immediate binding, the
   different `external-provisioner` instances compete with each for
   ownership of the volume by setting the "selected node"
   annotation. Delays are used to avoid the thundering herd problem.
   Once a node has been selected, provisioning continues as with late
   binding. This is less efficient and therefore "late binding" is the
-  recommended binding mode.
+  recommended binding mode. The advantage is that this mode does not
+  depend on scheduler extensions to put pods onto nodes with PMEM
+  because once a volume has been created, the pod will automatically
+  run on the node of the volume. The downside is that a volume might
+  have been created on a node which has insufficient RAM and CPU
+  resources for a pod.
 
 PMEM-CSI also has a central component which implements the [scheduler
 extender](#scheduler-extender) webhook. That component needs to know
@@ -216,6 +225,16 @@ strength for their purposes and manage certificate distribution.
 A production deployment can improve upon that by using some other key
 delivery mechanism, like for example
 [Vault](https://www.vaultproject.io/).
+
+The PMEM-CSI controller runs with the default security context. On
+upstream Kubernetes, this means that it runs as root. The expectation
+is that actual production deployments of PMEM-CSI will avoid that, for
+example with the help of [OpenShift's dynamid UID
+assignment](https://www.openshift.com/blog/a-guide-to-openshift-and-uids).
+
+The PMEM-CSI node driver must run as root because it has to access the
+node's `/dev` and `/sys` and needs to execute privileged operations
+like mounting.
 
 ## Volume Persistency
 
@@ -268,7 +287,38 @@ volumes](https://kubernetes.io/docs/concepts/storage/ephemeral-volumes/#generic-
 which are an alpha feature in Kubernetes 1.19 and supported by
 PMEM-CSI because they use the normal volume provisioning process.
 
-See [exposing persistent and cache volumes](install.md#expose-persistent-and-cache-volumes-to-applications) for configuration information.
+See [volume parameters](install.md#volume-parameters) for configuration information.
+
+## Volume Size
+
+The size of a volume reflects how much of the underlying storage that
+is managed by PMEM-CSI is required for the volume. That size is also
+what needs to be specified when requesting a volume.
+
+For LVM, the number of blocks taken away from a volume group is the
+same as the number of blocks in the new logical volume. For direct
+mode, there is [some additional
+overhead](https://docs.pmem.io/ndctl-user-guide/managing-namespaces#fsdax-and-devdax-capacity-considerations). PMEM-CSI
+stores the additional meta data on the PMEM device (`--map=dev` in
+ndctl) because that way, volumes can be used without affecting the
+available DRAM on a node. The size of a namespace as listed by ndctl
+refers to the usable size in the block device for the namespace, which
+is less than the amount of PMEM reserved for the namespace in the
+region and thus also less than the requested volume size.
+
+In both modes, the filesystem created on the block device introduces
+further overhead. The overhead for the filesystem and the additional
+meta data in direct mode is something that users must consider when
+deploying applications.
+
+*Note*: Applications can request to map a file into memory that is too
+large for the filesystem. Attempts to actually *use* all of the mapped
+file then will lead to page faults once all available storage is
+exhausted. Applications should use `fallocate` to ensure that this
+won't happen. See [the memcached example
+YAML](/deploy/kustomize/memcached/persistent/memcached-persistent.yaml)
+for a way how to deal with this for applications that do not use
+`fallocate` themselves.
 
 ## Capacity-aware pod scheduling
 

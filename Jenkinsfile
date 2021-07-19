@@ -18,7 +18,7 @@ pipeline {
         /*
           Delay in seconds between dumping system statistics.
         */
-        LOGGING_SAMPLING_DELAY = "60"
+        LOGGING_SAMPLING_DELAY = "infinity"
 
         /*
           Pod names in the kube-system namespace for which
@@ -174,59 +174,59 @@ pipeline {
 
         // Some stages are skipped entirely when testing PRs, the
         // others skip certain tests in that case:
-        // - production deployment is only tested with Kubernetes 1.16
-        //   and testing deployment only with Kubernetes 1.18
+        // - production deployment is tested on the oldest supported Kubernetes
+        //   (less tests, runs faster)
+        // - testing deployment is tested on the newest supported Kubernetes
+        //   (more tests, runs longer, thus gets to use the existing worker)
         stage('Testing') {
             parallel {
-                // This runs most tests and thus gets to use the initial worker immediately.
-                stage('1.19') {
+                stage('1.21') {
                     options {
-                        timeout(time: 540, unit: "MINUTES")
+                        timeout(time: 12, unit: "HOURS")
                     }
                     steps {
-                        TestInVM("", "fedora", "", "1.19", "Top.Level..[[:alpha:]]*-production[[:space:]]")
+                        // Skip production, i.e. run testing.
+                        TestInVM("", "fedora", "", "1.21", "Top.Level..[[:alpha:]]*-production[[:space:]]")
                     }
                 }
 
                 // All others set up their own worker.
-                stage('1.18') {
-                    when { not { changeRequest() } }
+                stage('1.20') {
+                    when {
+		        beforeAgent true
+		        not { changeRequest() }
+                    }
                     options {
-                        timeout(time: 540, unit: "MINUTES")
+                        timeout(time: 12, unit: "HOURS")
                     }
                     agent {
                         label "pmem-csi"
                     }
                     steps {
-                        TestInVM("fedora-1.18", "fedora", "", "1.18", "")
+                        TestInVM("fedora-1.20", "fedora", "", "1.20", "")
                     }
                 }
-                stage('1.17') {
+                stage('1.19') {
                     options {
-                        timeout(time: 540, unit: "MINUTES")
+                        timeout(time: 12, unit: "HOURS")
                     }
                     agent {
                         label "pmem-csi"
                     }
                     steps {
-                        TestInVM("fedora-1.17", "fedora", "", "1.17", "Top.Level..[[:alpha:]]*-testing[[:space:]]")
+                        // Skip testing, i.e. run production.
+                        TestInVM("fedora-1.19", "fedora", "", "1.19",  "Top.Level..[[:alpha:]]*-testing[[:space:]]")
                     }
                 }
+            }
+        }
 
-                // Disabled because of stability issues:
-                // - https://github.com/clearlinux/distribution/issues/2007
-                // - https://github.com/clearlinux/distribution/issues/1980
-                // stage('Clear Linux, 1.17') {
-                //     options {
-                //         timeout(time: 240, unit: "MINUTES")
-                //     }
-                //     agent {
-                //         label "pmem-csi"
-                //     }
-                //     steps {
-                //         TestInVM("clear-1.17", "clear", "${env.CLEAR_LINUX_VERSION_1_17}", "",  "Top.Level..[[:alpha:]]*-testing[[:space:]]")
-                //     }
-                // }
+        // This doesn't do anything. It's just serves as a reminder that "unstable"
+        // test steps are not the same as "successful". We had those for a while when
+        // accidentally ignoring the "make test_e2e" return code.
+        stage('Testing succeeded') {
+            steps {
+                echo "Testing succeeded."
             }
         }
 
@@ -453,19 +453,18 @@ void TestInVM(worker, distro, distroVersion, kubernetesVersion, skipIfPR) {
         up ourselves. "make stop" was hanging and waiting for these processes to
         exit even though there were from a different "docker exec" invocation.
 
-        The default QEMU cpu enables nested virtualization with "-cpu
-        host".  However, that fails on some Azure machines
-        (`qemu-system-x86_64: error: failed to set MSR 0x48b to
-        0x1582e00000000`,
-        https://www.mail-archive.com/qemu-devel@nongnu.org/msg665051.html),
+        The default QEMU cpu enables nested virtualization with "-cpu host".
+        However, that fails on some Azure machines:
+        `qemu-system-x86_64: error: failed to set MSR 0x48b to 0x1582e00000000`,
+        https://www.mail-archive.com/qemu-devel@nongnu.org/msg665051.html,
         so for now we disable VMX with -vmx.
-
-        TODO: test in parallel (on different nodes? single node didn't work,
-        https://github.com/intel/pmem-CSI/pull/309#issuecomment-504659383)
         */
-        sh " \
+        sh "#!/bin/bash\n \
+           echo Note: job output is filtered, see joblog-${BUILD_TAG}-test-${kubernetesVersion}.log artifact for full output. && \
+           set -o pipefail && \
+           ( \
            loggers=; \
-           atexit () { set -x; kill \$loggers; killall sleep; }; \
+           atexit () { set -x; kill \$loggers ||true; killall sleep ||true; }; \
            trap atexit EXIT; \
            mkdir -p build/reports && \
            if ${env.LOGGING_JOURNALCTL}; then sudo journalctl -f; fi & \
@@ -484,7 +483,7 @@ void TestInVM(worker, distro, distroVersion, kubernetesVersion, skipIfPR) {
                   ${env.BUILD_CONTAINER} \
                   bash -c 'set -x; \
                            loggers=; \
-                           atexit () { set -x; kill \$loggers; }; \
+                           atexit () { set -x; kill \$loggers ||true; }; \
                            trap atexit EXIT; \
                            make stop && \
                            make start && \
@@ -509,15 +508,13 @@ void TestInVM(worker, distro, distroVersion, kubernetesVersion, skipIfPR) {
                            testrun=\$(echo '${distro}-${distroVersion}-${kubernetesVersion}' | sed -e s/--*/-/g | tr . _ ) && \
                            make test_e2e TEST_E2E_REPORT_DIR=${WORKSPACE}/build/reports.tmp/\$testrun \
                                          TEST_E2E_SKIP=\$(if [ \"${env.CHANGE_ID}\" ] && [ \"${env.CHANGE_ID}\" != null ]; then echo \\\\[Slow\\\\]@${skipIfPR}; fi) \
-                           ' \
+                           ') 2>&1 | tee joblog-${BUILD_TAG}-test-${kubernetesVersion}.log | grep --line-buffered -E -e 'checking for test|Passed|FAIL:|^ERROR' \
            "
-    } catch (exc) {
-        echo "Handling exception, get pod state and kubelet logs:"
-        sh "_work/${env.CLUSTER}/ssh.0 kubectl get pods --all-namespaces -o wide"
-        sh "for cmd in `ls _work/${env.CLUSTER}/ssh.*`; do \$cmd sudo journalctl -u kubelet; done"
-        // regular error handling
-        throw exc
     } finally {
+        echo "Writing cluster state and kubelet logs into files."
+        sh "_work/${env.CLUSTER}/ssh.0 kubectl get nodes -o wide > joblog-${BUILD_TAG}-nodestate-${kubernetesVersion}.log"
+        sh "_work/${env.CLUSTER}/ssh.0 kubectl get pods --all-namespaces -o wide > joblog-${BUILD_TAG}-podstate-${kubernetesVersion}.log"
+        sh "for cmd in `ls _work/${env.CLUSTER}/ssh.*`; do \$cmd sudo journalctl -u kubelet >> joblog-${BUILD_TAG}-kubeletlogs-${kubernetesVersion}.log; done"
         // Each test run produces junit_*.xml files with testsuite name="PMEM E2E suite".
         // To make test names unique in the Jenkins UI, we rename that test suite per run,
         // mangle the <testcase name="..." classname="..."> such that
@@ -543,6 +540,7 @@ void TestInVM(worker, distro, distroVersion, kubernetesVersion, skipIfPR) {
                     diff $i build/reports/$testrun.xml || true
                fi
            done'''
+        archiveArtifacts('**/joblog-*')
         junit 'build/reports/**/*.xml'
     }
 }

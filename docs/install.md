@@ -1,22 +1,5 @@
 # Installation and Usage
 
-- [Prerequisites](#prerequisites)
-    - [Software required](#software-required)
-    - [Hardware required](#hardware-required)
-    - [Persistent memory pre-provisioning](#persistent-memory-pre-provisioning)
-- [Installation and setup](#installation-and-setup)
-    - [Install PMEM-CSI driver](#install-pmem-csi-driver)
-      - [Install using the operator](#install-using-the-operator)
-      - [Install from source](#install-from-source)
-    - [Volume parameters](#volume-parameters)
-    - [Kata Containers support](#kata-containers-support)
-    - [Ephemeral inline volumes](#ephemeral-inline-volumes)
-    - [Raw block volumes](#raw-block-volumes)
-    - [Enable scheduler extensions](#enable-scheduler-extensions)
-    - [Metrics support](#metrics-support)
-- [PMEM-CSI Deployment CRD](#pmem-csi-deployment-crd)
-- [Filing issues and contributing](#filing-issues-and-contributing)
-
 ## Overview
 
 This section summarizes the steps that may be needed during the entire
@@ -26,13 +9,13 @@ each step in more detail.
 
 When setting up a cluster, the administrator must install the PMEM
 hardware on nodes and configure some or all of those instances of PMEM for usage by
-PMEM-CSI ([prerequisites](#prerequisites)]. Nodes where PMEM-CSI is
+PMEM-CSI ([prerequisites](#prerequisites)). Nodes where PMEM-CSI is
 supposed to run must have a certain [label in
 Kubernetes](#installation-and-setup).
 
 The administrator must install PMEM-CSI, using [the PMEM-CSI
 operator](#install-using-the-operator) (recommended) or with [scripts
-and YAML files in the source code](#install-from-source). The default
+and YAML files in the source code](#install-via-yaml-files). The default
 install settings should work for most clusters. Some clusters don't
 use `/var/lib/kubelet` as the data directory for kubelet and then the
 corresponding PMEM-CSI setting must be changed accordingly because
@@ -42,8 +25,8 @@ the YAML files can be edited or modified with
 kustomize.
 
 A PMEM-CSI installation can only use [direct device
-mode](/docs/design.md#direct-device-mode) or [LVM
-device mode](/docs/design.md#direct-device-mode). It is possible to install
+mode](design.md#direct-device-mode) or [LVM
+device mode](design.md#lvm-device-mode). It is possible to install
 PMEM-CSI twice on the same cluster with different modes, with these restrictions:
 
 - The driver names must be different.
@@ -58,14 +41,26 @@ installation by name, which indirectly determines the device mode. A
 storage class also chooses which filesystem is used (xfs or ext4) and
 enables [Kata Containers support](#kata-containers-support).
 
-It is recommended that storage classes use `allowedTopologies` as in
-the [`pmem-storageclass.yaml`](/deploy/kustomize/storageclass/pmem-storageclass.yaml)
-to ensure that pods with volumes that use late binding land on a node
-where the driver is available.
-
 Optionally, the administrator can enable [the scheduler
-extensions](#enable-scheduler-extensions) (recommended) and monitoring
-of resource usage via the [metrics support](#metrics-support).
+extensions](#enable-scheduler-extensions) and monitoring of resource
+usage via the [metrics support](#metrics-support).
+
+It is [recommended](./design.md#dynamic-provisioning-of-local-volumes)
+to enable the scheduler extensions and use
+`volumeBindingMode: WaitForFirstConsumer` as in the
+[`pmem-storageclass-late-binding.yaml`](/deploy/common/pmem-storageclass-late-binding.yaml)
+example. This ensures that pods get scheduled onto nodes that have
+sufficient RAM, CPU and PMEM. Without the scheduler extensions, it is
+random whether the scheduler picks a node that has PMEM available and
+immediate binding (the default volume binding mode) might work
+better. However, then pods might not be able to run when the node
+where volumes were created are overloaded.
+
+Starting with Kubernetes 1.21, PMEM-CSI uses [storage capacity
+tracking](https://kubernetes.io/docs/concepts/storage/storage-capacity/)
+to handle Pod scheduling and the scheduler extensions are not needed
+anymore. `WaitForFirstConsumer` still is the recommended volume
+binding mode.
 
 Optionally, the log output format can be changed from the default
 "text" format (= the traditional glog format) to "json" (= output via
@@ -146,6 +141,17 @@ Example of creating regions in interleaved mode, using all NVDIMMs:
 $ ipmctl create -goal PersistentMemoryType=AppDirect
 ```
 
+If the operating system on the nodes does not provide `ipmctl`, then
+it can also be run inside a container, using the PMEM-CSI image. The same
+invocation works with `podman` instead of `docker`.
+``` console
+$ sudo docker run --privileged --rm -u 0:0 docker.io/intel/pmem-csi-driver:canary ipmctl help
+Intel(R) Optane(TM) Persistent Memory Command Line Interface
+
+    Usage: ipmctl <verb>[<options>][<targets>][<properties>]
+...
+```
+
 When running inside virtual machines, each virtual machine typically
 already gets access to one region and `ipmctl` is not needed inside
 the virtual machine. Instead, that region must be made available for
@@ -204,12 +210,46 @@ $ ls -l /dev/pmem*
 ls: cannot access '/dev/pmem*': No such file or directory
 ```
 
+On some virtual machines, for example VMware® vSphere, the persistent
+memory does not support setting labels and the `ndctl init-labels
+nmem0` command above would fail. What can be done in that case is to
+convert the existing namespace from "raw" to "fsdax" mode and
+then run PMEM-CSI in LVM mode. Direct mode is not possible because
+it depends on creating additional namespaces which in turn depends
+on support for labels. The command for conversion is:
+```console
+$ ndctl create-namespace --force --reconfig=namespace0.0 --mode=fsdax --name=pmem-csi
+{
+  "dev":"namespace0.0",
+  "mode":"fsdax",
+  "map":"dev",
+  "size":67643637760,
+  "uuid":"9fa6976c-ab57-491b-a00c-e52d092a4fa8",
+  "sector_size":512,
+  "align":2097152,
+  "blockdev":"pmem0",
+  "name":"pmem-csi"
+}
+```
+
+Note the `pmem-csi` name for the namespace: this is how PMEM-CSI in
+LVM mode knows that it is allowed to use this namespace. When the VM
+provides only "legacy PMEM", ndctl silently drops that name. In that
+case, the volume group as to be created manually:
+```console
+$ vgcreate --force bus0region0fsdax /dev/pmem0
+```
+
+See [automatic node setup](#automatic-node-setup) below for
+instructions on how to automate this conversion.
+
 ## Installation and setup
 
 This section assumes that a Kubernetes cluster is already available
-with at least one node that has persistent memory device(s). For development or
-testing, it is also possible to use a cluster that runs on QEMU virtual
-machines, see the ["QEMU and Kubernetes"](autotest.md#qemu-and-kubernetes).
+with at least one node that has persistent memory device(s). For
+development or testing, it is also possible to use a cluster that runs
+on QEMU virtual machines, see the ["QEMU and
+Kubernetes"](autotest.md#qemu-and-kubernetes).
 
 - **Make sure that the alpha feature gates CSINodeInfo and CSIDriverRegistry are enabled**
 
@@ -245,8 +285,8 @@ PMEM-CSI operator or by using reference yaml files provided in source code.
 
 #### Install using the operator
 
-[PMEM-CSI operator](./design.md#operator) facilitates deploying and managing
-the [PMEM-CSI driver](https://github.com/intel/pmem-csi) on a Kubernetes cluster.
+The [PMEM-CSI operator](./design.md#pmem-csi-operator) facilitates deploying and managing
+the PMEM-CSI driver on a Kubernetes cluster.
 
 ##### Installing the operator from Operator Hub
 
@@ -284,10 +324,17 @@ been created in that namespace to be deleted.
 
 Once the operator is installed and running, it is ready to handle
 `PmemCSIDeployment` objects in the `pmem-csi.intel.com` API group.
-Refer to the [PmemCSIDeployment CRD API](#PMEM-CSI-Deployment-CRD)
+Refer to the [PmemCSIDeployment CRD API](#pmem-csi-deployment-crd)
 for a complete list of supported properties.
 
 Here is a minimal example driver deployment created with a custom resource:
+
+**NOTE**: `nodeSelector` must match the node label that was set in the
+[installation and setup](#installation-and-setup) section. The PMEM-CSI
+[scheduler extender](design.md#scheduler-extender) and
+[webhook](design.md#pod-admission-webhook) are not enabled in this basic
+installation. See [below](#enable-scheduler-extensions) for
+instructions about that.
 
 ``` ShellSession
 $ kubectl create -f - <<EOF
@@ -304,7 +351,7 @@ EOF
 
 This uses the same `pmem-csi.intel.com` driver name as the YAML files
 in [`deploy`](/deploy) and the node label created by NFD (see the [hardware
-installation and setup section](#installation-and-setup).
+installation and setup section](#installation-and-setup)).
 
 Once the above deployment installation is successful, we can see all the driver
 pods in `Running` state:
@@ -324,30 +371,7 @@ Metadata:
   Creation Timestamp:  2020-10-07T07:31:58Z
   Generation:          1
   Managed Fields:
-    API Version:  pmem-csi.intel.com/v1beta1
-    Fields Type:  FieldsV1
-    fieldsV1:
-      f:spec:
-        .:
-        f:deviceMode:
-        f:nodeSelector:
-          .:
-          f:storage:
-    Manager:      kubectl-create
-    Operation:    Update
-    Time:         2020-10-07T07:31:58Z
-    API Version:  pmem-csi.intel.com/v1beta1
-    Fields Type:  FieldsV1
-    fieldsV1:
-      f:status:
-        .:
-        f:conditions:
-        f:driverComponents:
-        f:lastUpdated:
-        f:phase:
-    Manager:         pmem-csi-operator
-    Operation:       Update
-    Time:            2020-10-07T07:32:22Z
+    ...
   Resource Version:  1235740
   Self Link:         /apis/pmem-csi.intel.com/v1beta1/pmemcsideployments/pmem-csi.intel.com
   UID:               d8635490-53fa-4eec-970d-cd4c76f53b23
@@ -384,27 +408,15 @@ Events:
   Normal  Running        39s   pmem-csi-operator  Driver deployment successful
 
 $ kubectl get pod -n pmem-csi
-NAME                               READY   STATUS    RESTARTS   AGE
-pmem-csi-intel-com-controller-0    2/2     Running   0          51s
-pmem-csi-intel-com-node-4x7cv      2/2     Running   0          50s
-pmem-csi-intel-com-node-6grt6      2/2     Running   0          50s
-pmem-csi-intel-com-node-msgds      2/2     Running   0          51s
-pmem-csi-operator-749c7c7c69-k5k8n 1/1     Running   0          3m
+NAME                                             READY   STATUS    RESTARTS   AGE
+pmem-csi-intel-com-controller-79cd9f799d-rt54d   2/2     Running   0          51s
+pmem-csi-intel-com-node-4x7cv                    2/2     Running   0          50s
+pmem-csi-intel-com-node-6grt6                    2/2     Running   0          50s
+pmem-csi-intel-com-node-msgds                    2/2     Running   0          51s
+pmem-csi-operator-749c7c7c69-k5k8n               1/1     Running   0          3m
 ```
 
-By default, the operator creates the needed private keys and certificates required
-for running the driver as described in the [driver security](./design.md#security)
-section. Those certificates are generated by the operator using a self-signed CA.
-This can be overridden with custom keys and certificates by using appropriate fields
-in the [PmemCSIDeployment specification](#deploymentspec). These encoded certificates
-and private keys are made available to driver pods via Kubernetes
-[secrets](https://kubernetes.io/docs/concepts/configuration/secret/) by the operator.
-
-**NOTE:** A production deployment that is not supposed to depend on the
-operator's self-signed CA instead must provide the certificates generated
-from a trusted certificate authority.
-
-#### Install from source
+#### Install via YAML files
 
 - **Get source code**
 
@@ -436,8 +448,13 @@ running the PMEM-CSI [scheduler extender](design.md#scheduler-extender) and
 [webhook](design.md#pod-admission-webhook). If those are not used, then certificate
 creation can be skipped. However, the YAML deployment files always create the PMEM-CSI
 controller StatefulSet which needs the certificates. Without them, the
-`pmem-csi-intel-com-controller-0` pod cannot start, so it is recommended to create
-certificates or customize the deployment so that this StatefulSet is not created.
+`pmem-csi-intel-com-controller` pod cannot start, so it is recommended to create
+certificates or customize the deployment so that this Deployment is not created.
+
+On OpenShift, certificates can be created automatically as described
+in https://docs.openshift.com/container-platform/4.6/security/certificates/service-serving-certificate.html.
+The PMEM-CSI operator uses that approach and therefore is a
+simpler way to install PMEM-CSI on OpenShift.
 
 Certificates can be created by running the `./test/setup-ca-kubernetes.sh` script for your cluster.
 This script requires "cfssl" tools which can be downloaded.
@@ -472,10 +489,10 @@ For each Kubernetes version, four different deployment variants are provided:
    - `testing`: the variants with `testing` in the name enable debugging
      features and shouldn't be used in production.
 
-For example, to deploy for production with LVM device mode onto Kubernetes 1.17, use:
+For example, to deploy for production with LVM device mode onto Kubernetes 1.18, use:
 
 ``` console
-$ kubectl create -f deploy/kubernetes-1.17/pmem-csi-lvm.yaml
+$ kubectl create -f deploy/kubernetes-1.18/pmem-csi-lvm.yaml
 ```
 
 The PMEM-CSI [scheduler extender](design.md#scheduler-extender) and
@@ -495,7 +512,7 @@ for `kubectl kustomize`. For example:
      $ cat >my-pmem-csi-deployment/kustomization.yaml <<EOF
      namespace: pmem-driver
      bases:
-       - ../deploy/kubernetes-1.17/lvm
+       - ../deploy/kubernetes-1.18/lvm
      EOF
      $ kubectl create --kustomize my-pmem-csi-deployment
      ```
@@ -506,7 +523,7 @@ for `kubectl kustomize`. For example:
      $ mkdir -p my-pmem-csi-deployment
      $ cat >my-pmem-csi-deployment/kustomization.yaml <<EOF
      bases:
-       - ../deploy/kubernetes-1.17/lvm
+       - ../deploy/kubernetes-1.18/lvm
      patchesJson6902:
        - target:
            group: apps
@@ -529,108 +546,322 @@ for `kubectl kustomize`. For example:
 
 ``` console
 $ kubectl get pods -n pmem-csi
-NAME                    READY   STATUS    RESTARTS   AGE
-pmem-csi-intel-com-node-8kmxf     2/2     Running   0          3m15s
-pmem-csi-intel-com-node-bvx7m     2/2     Running   0          3m15s
-pmem-csi-intel-com-controller-0   2/2     Running   0          3m15s
-pmem-csi-intel-com-node-fbmpg     2/2     Running   0          3m15s
+NAME                                             READY   STATUS    RESTARTS   AGE
+pmem-csi-intel-com-controller-79cd9f799d-rt54d   2/2     Running   0          3m15s
+pmem-csi-intel-com-node-8kmxf                    2/2     Running   0          3m15s
+pmem-csi-intel-com-node-bvx7m                    2/2     Running   0          3m15s
+pmem-csi-intel-com-node-fbmpg                    2/2     Running   0          3m15s
 ```
 
-After the driver is deployed using one of the methods mentioned above,
-verify that the node labels have been updated correctly:
+### Volume parameters
 
-``` console
-$ kubectl get nodes --show-labels
-```
+A Kubernetes cluster administrators must define some volume parameters
+like the filesystem type in [storage
+classes](https://kubernetes.io/docs/concepts/storage/storage-classes).
+Users then reference those storage classes when requesting generic
+ephemeral inline or persistent volumes. The size of volumes can be chosen
+by users.
 
-The command output must indicate that every node with PMEM has at least two labels:
-``` console
-pmem-csi.intel.com/node=<NODE-NAME>,storage=pmem
-```
-
-**storage=pmem** is the label that has to be added manually as
-described above.  When using NFD, the node should have the
-`feature.node.kubernetes.io/memory-nv.dax=true` label.
-
-If **pmem-csi.intel.com/node** is missing, then double-check that the
-alpha feature gates are enabled, that the CSI driver is running on the node,
-and that the driver's log output doesn't contain errors.
-
-- **Define two storage classes using the driver**
-
-``` console
-$ kubectl create -f deploy/common/pmem-storageclass-ext4.yaml
-$ kubectl create -f deploy/common/pmem-storageclass-xfs.yaml
-```
-
-- **Provision two PMEM-CSI volumes**
-
-``` console
-$ kubectl create -f deploy/common/pmem-pvc.yaml
-```
-
-- **Verify two Persistent Volume Claims have 'Bound' status**
-
-``` console
-$ kubectl get pvc
-NAME                STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS       AGE
-pmem-csi-pvc-ext4   Bound    pvc-f70f7b36-6b36-11e9-bf09-deadbeef0100   4Gi        RWO            pmem-csi-sc-ext4   16s
-pmem-csi-pvc-xfs    Bound    pvc-f7101fd2-6b36-11e9-bf09-deadbeef0100   4Gi        RWO            pmem-csi-sc-xfs    16s
-```
-
-- **Start two applications requesting one provisioned volume each**
-
-``` console
-$ kubectl create -f deploy/common/pmem-app.yaml
-```
-
-These applications each request a mount of a volume,
-one with ext4-format and another with xfs-format file system.
-
-- **Verify two application pods reach 'Running' status**
-
-``` console
-$ kubectl get po my-csi-app-1 my-csi-app-2
-NAME           READY   STATUS    RESTARTS   AGE
-my-csi-app-1   1/1     Running   0          6m5s
-NAME           READY   STATUS    RESTARTS   AGE
-my-csi-app-2   1/1     Running   0          6m1s
-```
-
-- **Check that applications have a pmem volume mounted with added dax option**
-
-``` console
-$ kubectl exec my-csi-app-1 -- df /data
-Filesystem           1K-blocks      Used Available Use% Mounted on
-/dev/ndbus0region0fsdax/5ccaa889-551d-11e9-a584-928299ac4b17
-                       4062912     16376   3820440   0% /data
-
-$ kubectl exec my-csi-app-2 -- df /data
-Filesystem           1K-blocks      Used Available Use% Mounted on
-/dev/ndbus0region0fsdax/5cc9b19e-551d-11e9-a584-928299ac4b17
-                       4184064     37264   4146800   1% /data
-
-$ kubectl exec my-csi-app-1 -- mount |grep /data
-/dev/ndbus0region0fsdax/5ccaa889-551d-11e9-a584-928299ac4b17 on /data type ext4 (rw,relatime,dax)
-
-$ kubectl exec my-csi-app-2 -- mount |grep /data
-/dev/ndbus0region0fsdax/5cc9b19e-551d-11e9-a584-928299ac4b17 on /data type xfs (rw,relatime,attr2,dax,inode64,noquota)
-```
-
-#### Volume parameters
-
-Kubernetes cluster administrators can make persistent volumes available
-to applications using storage classes, with the behavior of the volumes
-determined by [`StorageClass
-Parameters`](https://kubernetes.io/docs/concepts/storage/storage-classes/#parameters).
-
-In addition to the normal parameters defined by Kubernetes, PMEM-CSI supports
-the following custom parameters in a storage class:
+`xfs` and `ext4` are supported filesystem types. In addition to the
+normal parameters defined by Kubernetes, PMEM-CSI supports the
+following custom parameters in a storage class:
 
 |key|meaning|optional|values|
 |---|-------|--------|-------------|
-|`eraseAfter`|Clear all data after use and before<br> deleting the volume|Yes|`true` (default),<br> `false`|
-|`kataContainers`|Prepare volume for use with DAX in Kata Containers.|Yes|`false/0/f/FALSE` (default),<br> `true/1/t/TRUE`|
+|`eraseAfter`|Clear all data by overwriting with zeroes after use and before deleting the volume|Yes|`true` (default), `false`|
+|`kataContainers`|Prepare volume for use with DAX in Kata Containers.|Yes|`false/0/f/FALSE` (default), `true/1/t/TRUE`|
+
+
+### Creating volumes
+
+This section uses files from the [common example directory](/deploy/common).
+It is not necessary to check out the repository to use them.
+
+Create a storage class with late binding, the recommended mode:
+``` console
+$ kubectl apply -f https://github.com/intel/pmem-csi/raw/devel/deploy/common/pmem-storageclass-late-binding.yaml
+storageclass.storage.k8s.io/pmem-csi-sc-late-binding created
+```
+
+Then request a volume which uses that class:
+``` console
+$ kubectl apply -f https://github.com/intel/pmem-csi/raw/devel/deploy/common/pmem-pvc-late-binding.yaml
+persistentvolumeclaim/pmem-csi-pvc-late-binding created
+```
+
+At this point, the volume is not yet getting created because of the
+late binding mode:
+``` console
+$ kubectl describe pvc/pmem-csi-pvc-late-binding
+Name:          pmem-csi-pvc-late-binding
+Namespace:     default
+StorageClass:  pmem-csi-sc-late-binding
+Status:        Pending
+Volume:        
+Labels:        <none>
+Annotations:   <none>
+Finalizers:    [kubernetes.io/pvc-protection]
+Capacity:      
+Access Modes:  
+VolumeMode:    Filesystem
+Used By:       <none>
+Events:
+  Type    Reason                Age               From                         Message
+  ----    ------                ----              ----                         -------
+  Normal  WaitForFirstConsumer  0s (x2 over 14s)  persistentvolume-controller  waiting for first consumer to be created before binding
+```
+
+The volume gets created once the first Pod starts to use it, on a node that is suitable for that Pod:
+``` console
+$ kubectl apply -f https://github.com/intel/pmem-csi/raw/devel/deploy/common/pmem-app-late-binding.yaml
+pod/my-csi-app created
+```
+
+After a short while, the volume is created and the pod can run:
+``` console
+$ kubectl get pvc,pods -o wide
+NAME                                              STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS               AGE
+persistentvolumeclaim/pmem-csi-pvc-late-binding   Bound    pvc-ade8dc48-a4c0-4f30-b479-84460a3e0591   4Gi        RWO            pmem-csi-sc-late-binding   55s
+
+NAME             READY   STATUS    RESTARTS   AGE
+pod/my-csi-app   1/1     Running   0          47s
+```
+
+The volume was mounted with `dax=always`, therefore all file operations and memory regions mapped from that
+volume into the address space of an application directly access the underlying PMEM:
+``` console
+$ kubectl exec my-csi-app -- df /data
+Filesystem                                                                              1K-blocks  Used Available Use% Mounted on
+/dev/ndbus0region0fsdax/pvc-7d-83241976933418f96748a1c18d500c6cba91c1dfaa87145b7893569c   4062912 16376   3820440   1% /data
+
+$ kubectl exec my-csi-app -- mount |grep /data
+/dev/ndbus0region0fsdax/pvc-7d-83241976933418f96748a1c18d500c6cba91c1dfaa87145b7893569c on /data type ext4 (rw,relatime,seclabel,dax=always)
+```
+
+### Troubleshooting
+
+A few things can go wrong when trying out the previous example.
+
+#### Driver or operator fails
+
+This shows up in `kubectl get pods --all-namespaces` as failed Pods
+and can be investigated with `kubectl describe --namespace <driver
+namespace> pods/<pod name>` and `kubectl logs --namespace <driver
+namespace> <pod name> pmem-driver` or one of the other containers
+in that Pod.
+
+When using deployment files from the `devel` branch, the corresponding
+container `canary` image might not have been published yet. Better use
+the [latest stable release](https://intel.github.io/pmem-csi/).
+
+#### No driver Pod created for a node
+
+This can be checked with `kubectl get pods --all-namespaces -o wide`.
+Have nodes been labeled as expected by the driver deployment? Check
+with `kubectl get nodes -o yaml`.
+
+#### Example Pod getting assigned to a node with no PMEM
+
+This can happen on clusters where only some worker nodes have PMEM and
+the [PMEM-CSI scheduler extensions](#enable-scheduler-extensions) are
+not enabled. This can be checked by looking at the `selected-node`
+annotation of the PVC:
+``` console
+$ kubectl get pvc/pmem-csi-pvc-late-binding -o yaml | grep ' volume.kubernetes.io/selected-node:'
+    volume.kubernetes.io/selected-node: pmem-csi-pmem-govm-worker2
+```
+
+The PMEM-CSI controller pod will detect this and ask the scheduler to
+pick a node anew by removing that annotation, but it is random whether
+the next choice is better and starting the Pod may get delayed.
+
+To avoid this, enable the scheduler extensions.
+
+#### Example Pod getting assigned to a node with insufficient PMEM
+
+This also can only happen when the [PMEM-CSI scheduler
+extensions](#enable-scheduler-extensions) are not enabled. Then volume
+creation is attempted repeatedly, potentially on different nodes, but
+fails with `not enough space` errors:
+
+``` console
+$ kubectl describe pvc/pmem-csi-pvc-late-binding
+Name:          pmem-csi-pvc-late-binding
+Namespace:     default
+StorageClass:  pmem-csi-sc-late-binding
+Status:        Pending
+Volume:        
+Labels:        <none>
+Annotations:   volume.beta.kubernetes.io/storage-provisioner: pmem-csi.intel.com
+Finalizers:    [kubernetes.io/pvc-protection]
+Capacity:      
+Access Modes:  
+VolumeMode:    Filesystem
+Used By:       my-csi-app
+Events:
+  Type     Reason                Age                     From                                                                                   Message
+  ----     ------                ----                    ----                                                                                   -------
+  Normal   WaitForFirstConsumer  7m30s                   persistentvolume-controller                                                            waiting for first consumer to be created before binding
+  Normal   WaitForPodScheduled   6m (x15 over 7m19s)     persistentvolume-controller                                                            waiting for pod my-csi-app to be scheduled
+  Warning  ProvisioningFailed    3m59s (x12 over 7m19s)  pmem-csi.intel.com_pmem-csi-intel-com-node-nwkqv_cc2984e6-915f-4cf2-93a0-e143da407917  failed to provision volume with StorageClass "pmem-csi-sc-late-binding": rpc error: code = ResourceExhausted desc = Node CreateVolume: device creation failed: not enough space
+  Warning  ProvisioningFailed    2m47s (x12 over 7m18s)  pmem-csi.intel.com_pmem-csi-intel-com-node-9vlhf_6ac47898-58bf-45e1-b601-5d8f39d21f4e  failed to provision volume with StorageClass "pmem-csi-sc-late-binding": rpc error: code = ResourceExhausted desc = Node CreateVolume: device creation failed: not enough space
+  Normal   ExternalProvisioning  2m23s (x28 over 7m19s)  persistentvolume-controller                                                            waiting for a volume to be created, either by external provisioner "pmem-csi.intel.com" or manually created by system administrator
+  Normal   Provisioning          2m11s (x14 over 7m18s)  pmem-csi.intel.com_pmem-csi-intel-com-node-9vlhf_6ac47898-58bf-45e1-b601-5d8f39d21f4e  External provisioner is provisioning volume for claim "default/pmem-csi-pvc-late-binding"
+  Normal   Provisioning          107s (x16 over 7m19s)   pmem-csi.intel.com_pmem-csi-intel-com-node-nwkqv_cc2984e6-915f-4cf2-93a0-e143da407917  External provisioner is provisioning volume for claim "default/pmem-csi-pvc-late-binding"
+```
+
+The scheduler extensions prevent these useless attempts on nodes with
+insufficient PMEM. When none of the available nodes have sufficient
+PMEM, the attempt to schedule the example Pod fails:
+
+``` console
+$ kubectl describe pod/my-csi-app
+Name:         my-csi-app
+Namespace:    default
+...
+Events:
+  Type     Reason            Age                From               Message
+  ----     ------            ----               ----               -------
+  Warning  FailedScheduling  12s (x2 over 12s)  default-scheduler  0/4 nodes are available: 1 node(s) had taint {node-role.kubernetes.io/master: }, that the pod didn't tolerate, 3 only 63484MiB of PMEM available, need 400GiB.
+```
+
+#### Less PMEM available than expected
+
+This is usually the result of not preparing the node(s) as describe in
+[persistent memory
+pre-provisioning](#persistent-memory-pre-provisioning).
+
+One way of checking this is to look at the logs of the PMEM-CSI driver
+on a node. In this case, `region0` was completely unused and the
+driver was configured to use 50% of that for an LVM volume group:
+``` console
+$ kubectl get pods --all-namespaces -l app.kubernetes.io/name=pmem-csi-node -o wide
+NAMESPACE   NAME                            READY   STATUS    RESTARTS   AGE   IP                NODE                         NOMINATED NODE   READINESS GATES
+pmem-csi    pmem-csi-intel-com-node-d2mfh   3/3     Running   0          75s   192.168.200.66    pmem-csi-pmem-govm-worker3   <none>           <none>
+pmem-csi    pmem-csi-intel-com-node-jkbgz   3/3     Running   0          75s   192.168.133.134   pmem-csi-pmem-govm-worker1   <none>           <none>
+pmem-csi    pmem-csi-intel-com-node-th56d   3/3     Running   0          75s   192.168.220.67    pmem-csi-pmem-govm-worker2   <none>           <none>
+
+$ kubectl logs -n pmem-csi pmem-csi-intel-com-node-jkbgz pmem-driver
+I0623 07:15:18.710690       1 main.go:73] "PMEM-CSI started." version="v0.9.0-188-gd451ec6f3-dirty"
+I0623 07:15:18.711645       1 pmd-lvm.go:328] "LVM-New/setupNS: Checking region for fsdax namespaces" region="region0" percentage=50 size="64Gi" available="64Gi" max-available-extent="64Gi" may-use="32Gi"
+I0623 07:15:18.712251       1 pmd-lvm.go:361] "LVM-New/setupNS: Create fsdax namespace" size="32Gi"
+I0623 07:15:19.041186       1 region.go:282] "LVM-New/setupNS/CreateNamespace: Namespace created" region="region0" namespace="namespace0.1" usable-size="32254Mi" raw-size="32Gi" uuid="c3e6fe52-d3f2-11eb-b33e-c2b1549139a7"
+I0623 07:15:19.079791       1 pmd-lvm.go:422] "LVM-New/setupVG/setupVGForNamespace: Creating new volume group" vg="ndbus0region0fsdax"
+I0623 07:15:19.130041       1 mount_linux.go:163] Detected OS without systemd
+I0623 07:15:19.130661       1 server.go:54] "GRPC Server: Listening for connections" endpoint="unix:///csi/csi.sock"
+I0623 07:15:19.180760       1 pmem-csi-driver.go:305] "PMEM-CSI ready." capacity="32252Mi maximum volume size, 32252Mi available, 32252Mi managed, 64Gi total"
+```
+
+In a production environment, the [metrics support](#metrics-support)
+could be used to monitor available PMEM per node.
+
+### Automatic node setup
+
+The expectation is that the scripts which bring up nodes can be
+adapted to prepare the PMEM for usage by PMEM-CSI as explained
+earlier. But this might not always be easy.
+
+For the case of converting an existing "raw" namespace to "fsdax" mode
+there is a possibility to do the conversion through a deployed
+PMEM-CSI driver:
+
+1. Install PMEM-CSI in LVM mode without preparing nodes. At this point
+   only the central controller pod will run.
+1. For each node that has one or more raw namespaces that all need
+   to be converted, set the `<driver name>/convert-raw-namespaces` label (usually
+   `pmem-csi.intel.com/convert-raw-namespaces`) to `force`.
+1. This will cause the pods of the `pmem-csi-intel-com-node-setup`
+   DaemonSet to run on those nodes. Those pods then will
+   convert the namespaces, create the LVM volume group,
+   remove the `convert-raw-namespaces` label
+   (i.e. the pods will only run once) and add the normal label
+   that enables the PMEM-CSI node driver pods to run.
+1. The normal node driver pods start up and then are
+   ready to provision volumes.
+
+**WARNING**: the raw namespaces will be converted even when they are
+active. If data was stored on them, it will be lost after the
+conversion.
+
+The output of a successful conversion will look like this:
+```
+I0623 07:32:52.773207       1 main.go:73] "PMEM-CSI started." version="v0.9.0-188-gd451ec6f3-dirty"
+I0623 07:32:52.774386       1 convert.go:79] "ForceConvertRawNamespaces/convert: checking for namespaces"
+I0623 07:32:52.774871       1 convert.go:81] "ForceConvertRawNamespaces/convert: checking" bus="{\"dev\":\"ndbus0\",\"dimms\":[{}],\"provider\":\"ACPI.NFIT\",\"regions\":[{}]}"
+I0623 07:32:52.775316       1 convert.go:83] "ForceConvertRawNamespaces/convert: checking" region="{\"available_size\":0,\"dev\":\"region0\",\"mappings\":[{}],\"max_available_extent\":0,\"namespaces\":[{}],\"size\":68719476736,\"type\":\"pmem\"}"
+I0623 07:32:52.775444       1 convert.go:90] "ForceConvertRawNamespaces/convert: checking" namespace="{\"blockdev\":\"pmem0\",\"dev\":\"namespace0.0\",\"enabled\":true,\"id\":0,\"mode\":\"raw\",\"name\":\"\",\"size\":68719476736,\"uuid\":\"1711a2a0-358d-4b14-a43c-8efa1a9f7154\"}"
+I0623 07:32:52.775550       1 convert.go:99] "ForceConvertRawNamespaces/convert: converting raw namespace" namespace="{\"blockdev\":\"pmem0\",\"dev\":\"namespace0.0\",\"enabled\":true,\"id\":0,\"mode\":\"raw\",\"name\":\"\",\"size\":68719476736,\"uuid\":\"1711a2a0-358d-4b14-a43c-8efa1a9f7154\"}"
+I0623 07:32:53.397897       1 convert.go:127] "ForceConvertRawNamespaces/convert: setting up volume group" namespace="{\"blockdev\":\"pmem0\",\"dev\":\"namespace0.0\",\"enabled\":false,\"id\":0,\"mode\":\"fsdax\",\"name\":\"\",\"size\":18446744073709551615,\"uuid\":\"00000000-0000-0000-0000-000000000000\"}" vg="ndbus0region0fsdax"
+I0623 07:32:53.434094       1 pmd-lvm.go:422] "ForceConvertRawNamespaces/convert/setupVGForNamespace: Creating new volume group" vg="ndbus0region0fsdax"
+I0623 07:32:53.457108       1 convert.go:133] "ForceConvertRawNamespaces/convert: converted to fsdax namespace" namespace="{\"blockdev\":\"pmem0\",\"dev\":\"namespace0.0\",\"enabled\":false,\"id\":0,\"mode\":\"fsdax\",\"name\":\"\",\"size\":18446744073709551615,\"uuid\":\"00000000-0000-0000-0000-000000000000\"}" vg="ndbus0region0fsdax"
+I0623 07:32:53.457148       1 convert.go:75] "ForceConvertRawNamespaces/convert: successful" converted=1
+I0623 07:32:53.479512       1 convert.go:172] "ForceConvertRawNamespaces/havePMEM: Volume group will be used by PMEM-CSI in LVM mode" vg="ndbus0region0fsdax"
+I0623 07:32:53.523412       1 convert.go:200] "ForceConvertRawNamespaces/relabel: Change node labels" node="pmem-csi-pmem-govm-master" patch="{\"metadata\":{\"labels\":{\"pmem-csi.intel.com/convert-raw-namespaces\": null, \"feature.node.kubernetes.io/memory-nv.dax\": \"true\"}}}"
+I0623 07:32:53.523605       1 pmem-csi-driver.go:326] "Raw namespace conversion is done, waiting for termination signal."
+I0623 07:33:03.954098       1 pmem-csi-driver.go:344] "Caught signal, terminating." signal="terminated"
+I0623 07:33:05.016426       1 main.go:93] "PMEM-CSI stopped."
+```
+
+It terminates once Kubernetes notices that the pod is no longer
+needed. This usually happens quickly, so a log monitoring solution
+may be needed to see this output because `kubectl logs` does not work
+for pods that were already deleted.
+
+The DaemonSet contains some information which is available longer:
+```console
+$ kubectl describe daemonsets/pmem-csi-intel-com-node-setup
+Name:           pmem-csi-intel-com-node-setup
+Selector:       app.kubernetes.io/instance=pmem-csi.intel.com,app.kubernetes.io/name=pmem-csi-node-setup,pmem-csi.intel.com/deployment=lvm-production
+Node-Selector:  pmem-csi.intel.com/convert-raw-namespaces=force
+Labels:         app.kubernetes.io/component=node-setup
+                app.kubernetes.io/instance=pmem-csi.intel.com
+                app.kubernetes.io/name=pmem-csi-node-setup
+                app.kubernetes.io/part-of=pmem-csi
+                pmem-csi.intel.com/deployment=lvm-production
+Annotations:    deprecated.daemonset.template.generation: 1
+Desired Number of Nodes Scheduled: 0
+Current Number of Nodes Scheduled: 0
+Number of Nodes Scheduled with Up-to-date Pods: 0
+Number of Nodes Scheduled with Available Pods: 0
+Number of Nodes Misscheduled: 0
+Pods Status:  0 Running / 0 Waiting / 0 Succeeded / 0 Failed
+Pod Template:
+  Labels:           app.kubernetes.io/component=node-setup
+                    app.kubernetes.io/instance=pmem-csi.intel.com
+                    app.kubernetes.io/name=pmem-csi-node-setup
+                    app.kubernetes.io/part-of=pmem-csi
+                    pmem-csi.intel.com/deployment=lvm-production
+                    pmem-csi.intel.com/webhook=ignore
+  Service Account:  pmem-csi-intel-com-node-setup
+  Containers:
+   pmem-driver:
+    Image:      172.17.42.1:5001/pmem-csi-driver:canary
+    Port:       <none>
+    Host Port:  <none>
+    Command:
+      /usr/local/bin/pmem-csi-driver
+      -v=3
+      -logging-format=text
+      -mode=force-convert-raw-namespaces
+      -nodeSelector={"storage":"pmem"}
+      -nodeid=$(KUBE_NODE_NAME)
+...
+Events:
+  Type    Reason            Age    From                  Message
+  ----    ------            ----   ----                  -------
+  Normal  SuccessfulCreate  5m47s  daemonset-controller  Created pod: pmem-csi-intel-com-node-setup-fr9b8
+  Normal  SuccessfulDelete  5m45s  daemonset-controller  Deleted pod: pmem-csi-intel-com-node-setup-fr9b8
+```
+
+If conversion fails, the pod will exit with an error and then get
+restarted automatically by Kubernetes to retry the conversion until it
+succeeds.
+
+It is considered a user error if conversion is requested for a node
+which has nothing to convert. To make that obvious, the pod will print
+an error and then exist with an error. That way, the pod continues to
+exist and the log can be inspected to identify the problem.
+
 
 
 ### Kata Containers support
@@ -668,7 +899,7 @@ done globally by setting the `memory_offset` in the
 file](https://github.com/kata-containers/runtime/blob/ee985a608015d81772901c1d9999190495fc9a0a/cli/config/configuration-qemu.toml.in#L86-L91)
 or per-pod by setting the
 [`io.katacontainers.config.hypervisor.memory_offset`
-label](https://github.com/kata-containers/documentation/blob/master/how-to/how-to-set-sandbox-config-kata.md#hypervisor-options)
+annotation](https://github.com/kata-containers/documentation/blob/master/how-to/how-to-set-sandbox-config-kata.md#hypervisor-options)
 in the pod meta data. In both cases, the value has to be large enough
 for all PMEM volumes used by the pod, otherwise pod creation will fail
 with an error similar to this:
@@ -677,11 +908,23 @@ with an error similar to this:
 Error: container create failed: QMP command failed: not enough space, currently 0x8000000 in use of total space for memory devices 0x3c100000
 ```
 
+**Note**:
+* The offset is currently (= Kata Containers 2.1.0) limited to
+32 bit, which implies that volumes cannot be larger than 4GiB. An
+enhancement request for [Kata Containers is
+pending](https://github.com/kata-containers/kata-containers/issues/2006).
+* A newer version is also needed for a fix of [issue
+#2018](https://github.com/kata-containers/kata-containers/issues/2018).
+* kata-deploy, at least in Kata Containers 2.1.0, does [not enable the
+  `memory_offset` annotation](https://github.com/kata-containers/kata-containers/issues/2088), leading to
+  `failed to create containerd task: annotation io.katacontainers.config.hypervisor.memory_offset is not enabled`
+  errors.
+
 The examples for usage of Kata Containers [with
 ephemeral](/deploy/common/pmem-kata-app-ephemeral.yaml) and
 [persistent](/deploy/common/pmem-kata-app.yaml) volumes use the pod
 label. They assume that the `kata-qemu` runtime class [is
-installed](https://github.com/kata-containers/packaging/tree/1.11.0-rc0/kata-deploy#run-a-sample-workload).
+installed](https://github.com/kata-containers/kata-containers/tree/2.1.0/tools/packaging/kata-deploy#run-a-sample-workload).
 
 For the QEMU test cluster,
 [`setup-kata-containers.sh`](/test/setup-kata-containers.sh) can be
@@ -698,15 +941,15 @@ This is the original implementation of ephemeral inline volumes for
 CSI drivers in Kubernetes. It is currently available as a beta feature
 in Kubernetes.
 
-Volume requests [embedded in the pod spec](https://kubernetes-csi.github.io/docs/ephemeral-local-volumes.html#example-of-inline-csi-pod-spec) are provisioned as
+Volume requests [embedded in the pod spec with the `csi` field](https://kubernetes-csi.github.io/docs/ephemeral-local-volumes.html) are provisioned as
 ephemeral volumes. The volume request could use below fields as
 [`volumeAttributes`](https://kubernetes.io/docs/concepts/storage/volumes/#csi):
 
 |key|meaning|optional|values|
 |---|-------|--------|-------------|
 |`size`|Size of the requested ephemeral volume as [Kubernetes memory string](https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/#meaning-of-memory) ("1Mi" = 1024*1024 bytes, "1e3K = 1000000 bytes)|No||
-|`eraseAfter`|Clear all data after use and before<br> deleting the volume|Yes|`true` (default),<br> `false`|
-|`kataContainers`|Prepare volume for use in Kata Containers.|Yes|`false/0/f/FALSE` (default),<br> `true/1/t/TRUE`|
+|`eraseAfter`|Clear all data by overwriting with zeroes after use and before deleting the volume|Yes|`true` (default), `false`|
+|`kataContainers`|Prepare volume for use in Kata Containers.|Yes|`false/0/f/FALSE` (default), `true/1/t/TRUE`|
 
 Try out ephemeral volume usage with the provided [example
 application](/deploy/common/pmem-app-ephemeral.yaml).
@@ -753,11 +996,19 @@ That example demonstrates how to handle some details:
 
 ### Enable scheduler extensions
 
+#### Manual scheduler configuration
+
+**NOTE**: this sections provides an in-depth explanation that makes no
+assumptions about how the cluster works. For simpler install
+instructions on OpenShift see [below](#openshift-scheduler-configuration).
+
 The PMEM-CSI scheduler extender and admission webhook are provided by
 the PMEM-CSI controller. They need to be enabled during deployment via
 the `--schedulerListen=[<listen address>]:<port>` parameter. The
 listen address is optional and can be left out. The port is where a
-HTTPS server will run.
+HTTPS server will run. The YAML files already enable this. The
+operator has the `controllerTLSSecret` and `mutatePods` properties in
+the [`DeploymentSpec`](#deploymentspec).
 
 The controller needs TLS certificates which must be created in
 advance. The YAML files expects them in a secret called
@@ -979,7 +1230,7 @@ bases:
 patchesJson6902:
   - target:
       group: admissionregistration.k8s.io
-      version: v1beta1
+      version: v1
       kind: MutatingWebhookConfiguration
       name: pmem-csi-intel-com-hook
     path: webhook-patch.yaml
@@ -994,12 +1245,158 @@ EOF
 $ kubectl create --kustomize my-webhook
 ```
 
+#### OpenShift scheduler configuration
+
+**NOTE**: The scheduler extensions are only needed on OpenShift 4.6
+and 4.7. On OpenShift 4.8, [storage capacity
+tracking](#storage-capacity-tracking) can and should be used instead.
+
+The operator should be used on OpenShift. When creating the
+deployment, set `controllerTLSSecret` to the special string
+`-openshift-`:
+
+``` ShellSession
+$ kubectl create -f - <<EOF
+apiVersion: pmem-csi.intel.com/v1beta1
+kind: PmemCSIDeployment
+metadata:
+  name: pmem-csi.intel.com
+spec:
+  deviceMode: lvm
+  nodeSelector:
+    feature.node.kubernetes.io/memory-nv.dax: "true"
+  controllerTLSSecret: -openshift-
+EOF
+```
+
+The webhook and the API server then get configured by the operator
+with [certificates created automatically by
+OpenShift](https://docs.openshift.com/container-platform/4.6/security/certificates/service-serving-certificate.html).
+
+The scheduler must be configured manually, using the same API as for
+[configuring scheduler
+policies](https://docs.openshift.com/container-platform/4.6/nodes/scheduling/nodes-scheduler-default.html#nodes-scheduler-default-modifying_nodes-scheduler-default). This
+can be done before or after deploying the PMEM-CSI driver. The
+configuration change can be left in place after removing a PMEM-CSI
+because it will then be ignored. However, without this step pods that
+use PMEM-CSI volumes will not get scheduled.
+
+Communication between the kube-scheduler and PMEM-CSI will be done via
+http and a service that listens on a dynamically allocated host
+port. This approach is necessary because:
+- kube-scheduler uses the host network and thus cannot connect to a
+  service that is only available inside the cluster and
+- There is no API for configuring TLS certificates.
+
+First, define the service inside the namespace where the PMEM-CSI
+operator runs:
+
+``` ShellSession
+oc apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: pmem-csi-intel-com-http-scheduler
+  namespace: pmem-csi
+spec:
+  selector:
+    app.kubernetes.io/name: pmem-csi-controller
+    app.kubernetes.io/instance: pmem-csi.intel.com # This must be the name of the PMEM-CSI deployment.
+  type: NodePort
+  ports:
+  - targetPort: 8001
+    port: 80
+EOF
+```
+
+Then create a scheduler policy. If such a policy already exists, the
+`extenders` section below must be added to it.
+
+``` ShellSession
+oc create -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-policy
+  namespace: openshift-config
+data:
+  policy.cfg: |
+    {
+      "kind" : "Policy",
+      "apiVersion" : "v1",
+      "extenders" : [
+        { "urlPrefix": "http://127.0.0.1:$(oc get service/pmem-csi-intel-com-http-scheduler -n pmem-csi -o jsonpath={.spec.ports[*].nodePort})",
+          "filterVerb": "filter",
+          "prioritizeVerb": "prioritize",
+          "nodeCacheCapable": true,
+          "weight": 1,
+          "managedResources": [
+            { "name": "pmem-csi.intel.com/scheduler",
+              "ignoredByScheduler": true
+            }
+          ]
+        }
+      ]
+    }
+EOF
+```
+
+Finally, activate the usage of that policy by updating the existing
+`scheduler/cluster` object. If a policy was set already, this command
+will fail with `The request is invalid`, in which case the existing
+policy config map must be edited.
+
+``` console
+$ oc patch scheduler/cluster --type json \
+   --patch '[{"op":"test","path":"/spec/policy/name","value":""}, {"op":"replace","path":"/spec/policy/name","value":"scheduler-policy"}]'
+scheduler.config.openshift.io/cluster patched
+```
+
+This causes schedulers to be restarted with a new configuration:
+
+``` console
+$ oc get events -n openshift-kube-scheduler-operator
+...
+14m         Normal    ConfigMapCreated                    deployment/openshift-kube-scheduler-operator               Created ConfigMap/policy-configmap -n openshift-kube-scheduler because it was missing
+14m         Normal    RevisionTriggered                   deployment/openshift-kube-scheduler-operator               new revision 7 triggered by "configmap/policy-configmap has changed"
+14m         Normal    ConfigMapCreated                    deployment/openshift-kube-scheduler-operator               Created ConfigMap/revision-status-7 -n openshift-kube-scheduler because it was missing
+14m         Normal    ConfigMapCreated                    deployment/openshift-kube-scheduler-operator               Created ConfigMap/kube-scheduler-pod-7 -n openshift-kube-scheduler because it was missing
+...
+13m         Normal    OperatorStatusChanged               deployment/openshift-kube-scheduler-operator               Status for clusteroperator/kube-scheduler changed: Progressing changed from True to False ("NodeInstallerProgressing: 1 nodes are at revision 8"),Available message changed from "StaticPodsAvailable: 1 nodes are active; 1 nodes are at revision 6; 0 nodes have achieved new revision 8" to "StaticPodsAvailable: 1 nodes are active; 1 nodes are at revision 8"
+13m         Normal    ConfigMapUpdated                    deployment/openshift-kube-scheduler-operator               Updated ConfigMap/revision-status-8 -n openshift-kube-scheduler:
+cause by changes in data.status
+13m         Normal    PodCreated                          deployment/openshift-kube-scheduler-operator               Created Pod/revision-pruner-8-tt-87fkd-master-0 -n openshift-kube-scheduler because it was missing
+
+$ oc get pods -n openshift-kube-scheduler -l app=openshift-kube-scheduler
+NAME                                         READY   STATUS    RESTARTS   AGE
+openshift-kube-scheduler-tt-87fkd-master-0   3/3     Running   0          11m
+
+$ oc exec -ti -n openshift-kube-scheduler openshift-kube-scheduler-tt-87fkd-master-0 -c kube-scheduler -- cat /etc/kubernetes/static-pod-resources/configmaps/policy-configmap/policy.cfg
+{
+  "kind" : "Policy",
+  "apiVersion" : "v1",
+  "extenders" : [
+    { "urlPrefix": "https://127.0.0.1:30674",
+      "filterVerb": "filter",
+      "prioritizeVerb": "prioritize",
+      "nodeCacheCapable": true,
+      "weight": 1,
+      "managedResources": [
+        { "name": "pmem-csi.intel.com/scheduler",
+          "ignoredByScheduler": true
+        }
+      ]
+    }
+  ]
+}
+```
+
 ### Storage capacity tracking
 
 [Kubernetes
 1.19](https://kubernetes.io/blog/2020/09/01/ephemeral-volumes-with-storage-capacity-tracking/)
 introduces support for publishing and using storage capacity
-information for pod scheduling. PMEM-CSI must be deployed
+information for pod scheduling. It became beta in 1.21. PMEM-CSI must be deployed
 differently to use this feature:
 
 - `external-provisioner` must be told to publish storage capacity
@@ -1008,21 +1405,9 @@ differently to use this feature:
   scheduler, otherwise it ignores that information when considering
   pods with unbound volume.
 
-Because the `CSIStorageCapacity` feature is still alpha in 1.19 and
-driver deployment would fail on a cluster without support for it, none
-of the normal deployment files nor the operator enable that. Instead,
-special kustomize variants are provided in
-`deploy/kubernetes-1.19-alpha*`.
+The deployments for Kubernetes >= 1.21 do this automatically. The
+alpha API in 1.19 and 1.20 is no longer supported.
 
-They can be used for example in the QEMU test cluster with:
-
-```console
-$ TEST_KUBERNETES_VERSION=1.19 make start
-...
-$ TEST_KUBERNETES_FLAVOR=-alpha test/setup-deployment.sh
-INFO: deploying from /nvme/gopath/src/github.com/intel/pmem-csi/deploy/kubernetes-1.19-alpha/lvm/testing
-...
-```
 
 ### Metrics support
 
@@ -1047,6 +1432,10 @@ method calls, and PMEM-CSI:
 Name | Type | Explanation
 -----|------|------------
 `build_info` | gauge | A metric with a constant '1' value labeled by version.
+`scheduler_request_duration_seconds` | histogram | Latencies for PMEM-CSI scheduler HTTP requests by operation ("mutate", "filter", "status") and method ("post").
+`scheduler_in_flight_requests` | gauge | Currently pending PMEM-CSI scheduler HTTP requests.
+`scheduler_requests_total` | counter | Number of HTTP requests to the PMEM-CSI scheduler, regardless of operation and method.
+`scheduler_response_size_bytes` | histogram | Histogram of response sizes for PMEM-CSI scheduler requests, regardless of operation and method.
 `csi_[sidecar\|plugin]_operations_seconds` | histogram | gRPC call duration and error code, for sidecar to driver (aka plugin) communication.
 `go_*` | | [Go runtime information](https://github.com/prometheus/client_golang/blob/master/prometheus/go_collector.go)
 `pmem_amount_available` | gauge | Remaining amount of PMEM on the host that can be used for new volumes.
@@ -1063,7 +1452,7 @@ containers provide different data. For example, the controller
 provides:
 
 ``` ShellSession
-$ kubectl port-forward pmem-csi-intel-com-controller-0 10010
+$ kubectl port-forward -n pmem-csi $(kubectl get pods -n pmem-csi -o name -l app.kubernetes.io/name=pmem-csi-controller) 10010
 Forwarding from 127.0.0.1:10010 -> 10010
 Forwarding from [::1]:10010 -> 10010
 ```
@@ -1173,8 +1562,6 @@ pmem_csi_node_operations_seconds_count{method_name="/csi.v1.Controller/CreateVol
 
 ## PMEM-CSI Deployment CRD
 
-TODO update operator
-
 `PmemCSIDeployment` is a cluster-scoped Kubernetes resource in the
 `pmem-csi.intel.com` API group. It describes how a PMEM-CSI driver
 instance is to be created.
@@ -1196,14 +1583,19 @@ The name is also used as prefix for the names of all objects created
 for the deployment and for the local `/var/lib/<name>` state directory
 on each node.
 
+Although the operator allows running multiple PMEM-CSI driver deployments, one
+has to take extreme care of such deployments by ensuring that not more than
+one driver ends up running on the same node(s). Nodes on which a PMEM-CSI
+driver could run can be configured by using the `nodeSelector` property of
+the `DeploymentSpec`.
+
 **NOTE**: Starting from release v0.9.0 reconciling of the `Deployment`
 CRD in `pmem-csi.intel.com/v1alpha1` API group is not supported by the
 PMEM-CSI operator anymore. Such resources in the cluster must be migrated
 manually to new the `PmemCSIDeployment` API.
 
-The current API for `PmemCSIDeployment` resources is:
 
-### PmemCSIDeployment
+The current API for `PmemCSIDeployment` resources is:
 
 |Field | Type | Description |
 |---|---|---|
@@ -1212,7 +1604,7 @@ The current API for `PmemCSIDeployment` resources is:
 | metadata | [ObjectMeta](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#metadata) | Object metadata, name used for CSI driver and as prefix for sub-objects |
 | spec | [DeploymentSpec](#deployment-spec) | Specification of the desired behavior of the deployment |
 
-#### DeploymentSpec
+### DeploymentSpec
 
 Below specification fields are valid in all API versions unless noted otherwise in the description.
 
@@ -1229,24 +1621,26 @@ of the API specification.
 | logLevel | integer | PMEM-CSI driver logging level | 3 |
 | logFormat | text | log output format | "text" or "json" <sup>3</sup> |
 | deviceMode | string | Device management mode to use. Supports one of `lvm` or `direct` | `lvm`
-| controllerTLSSecret | string | Name of an existing secret in the driver's namespace which contains ca.crt, tls.crt and tls.key data for the scheduler extender and pod mutation webhook. A controller is started if (and only if) this secret is specified. | empty
+| controllerTLSSecret | string | Name of an existing secret in the driver's namespace which contains ca.crt, tls.crt and tls.key data for the scheduler extender and pod mutation webhook. A controller is started if (and only if) this secret is specified. <br> Alternatively, the special string `-openshift-` can be used on OpenShift to let OpenShift create the necessary secrets. | empty
+| controllerReplicas | int | Number of concurrently running controller pods. | 1
 | mutatePods | Always/Try/Never | Defines how a mutating pod webhook is configured if a controller is started. The field is ignored if the controller is not enabled. "Never" disables pod mutation. "Try" configured it so that pod creation is allowed to proceed even when the webhook fails. "Always" requires that the webhook gets invoked successfully before creating a pod. | Try
-| schedulerNodePort | If non-zero, the scheduler service is created as a NodeService with that fixed port number. Otherwise that service is created as a cluster service. The number must be from the range reserved by Kubernetes for node ports. This is useful if the kube-scheduler cannot reach the scheduler extender via a cluster service. | 0
+| schedulerNodePort | int or string | If non-zero, the scheduler service is created as a NodeService with that fixed port number. Otherwise that service is created as a cluster service. The number must be from the range reserved by Kubernetes for node ports. This is useful if the kube-scheduler cannot reach the scheduler extender via a cluster service. | 0
 | controllerResources | [ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.12/#resourcerequirements-v1-core) | Describes the compute resource requirements for controller pod. <br/><sup>4</sup>_Deprecated and only available in `v1alpha1`._ |
 | nodeResources | [ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.12/#resourcerequirements-v1-core) | Describes the compute resource requirements for the pods running on node(s). <br/>_<sup>4</sup>Deprecated and only available in `v1alpha1`._ |
 | controllerDriverResources | [ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.12/#resourcerequirements-v1-core) | Describes the compute resource requirements for controller driver container running on master node. Available since `v1beta1`. |
 | nodeDriverResources | [ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.12/#resourcerequirements-v1-core) | Describes the compute resource requirements for the driver container running on worker node(s). <br/>_Available since `v1beta1`._ |
-| provisionerResources | [ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.12/#resourcerequirements-v1-core) | Describes the compute resource requirements for the [external provisioner](https://kubernetes-csi.github.io/docs/external-provisioner.html) sidecar container. <br>_Available since `v1beta1`._ |
+| provisionerResources | [ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.12/#resourcerequirements-v1-core) | Describes the compute resource requirements for the [external provisioner](https://kubernetes-csi.github.io/docs/external-provisioner.html) sidecar container. _Available since `v1beta1`._ |
 | nodeRegistrarResources | [ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.12/#resourcerequirements-v1-core) | Describes the compute resource requirements for the [driver registrar](https://kubernetes-csi.github.io/docs/node-driver-registrar.html) sidecar container running on worker node(s). <br/>_Available since `v1beta1`._ |
 | registryCert | string | Encoded tls certificate signed by a certificate authority used for driver's controller registry server | generated by operator self-signed CA |
 | nodeControllerCert | string | Encoded tls certificate signed by a certificate authority used for driver's node controllers | generated by operator self-signed CA |
 | registryKey | string | Encoded RSA private key used for signing by `registryCert` | generated by the operator |
 | nodeControllerKey | string | Encoded RSA private key used for signing by `nodeControllerCert` | generated by the operator |
 | caCert | string | Certificate of the CA by which the `registryCert` and `controllerCert` are signed | self-signed certificate generated by the operator |
-| nodeSelector | string map | [Labels to use for selecting Nodes](../docs/install.md#run-pmem-csi-on-kubernetes) on which PMEM-CSI driver should run. | `{ "storage": "pmem" }`|
+| nodeSelector | string map | Labels to use for selecting Nodes on which PMEM-CSI driver should run. | `{ "storage": "pmem" }`|
 | pmemPercentage | integer | Percentage of PMEM space to be used by the driver on each node. This is only valid for a driver deployed in `lvm` mode. This field can be modified, but by that time the old value may have been used already. Reducing the percentage is not supported. | 100 |
 | labels | string map | Additional labels for all objects created by the operator. Can be modified after the initial creation, but removed labels will not be removed from existing objects because the operator cannot know which labels it needs to remove and which it has to leave in place. |
 | kubeletDir | string | Kubelet's root directory path | /var/lib/kubelet |
+| maxUnavailable | int or string | maximum number of node drivers that are allowed to be down during a rolling update, given as absolute number or percentage of the total number of nodes with the driver | 1 |
 
 <sup>1</sup> To use the same container image as default driver image
 the operator pod must set with below environment variables with
@@ -1273,7 +1667,7 @@ propagated to the deployed driver, not all changes are safe. In
 particular, changing the `deviceMode` will not work when there are
 active volumes.
 
-#### DeploymentStatus
+### DeploymentStatus
 
 A PMEM-CSI Deployment's `status` field is a `DeploymentStatus` object, which
 carries the detailed state of the driver deployment. It is comprised of [deployment
@@ -1291,7 +1685,7 @@ The possible `phase` values and their meaning are as below:
 
 <sup>1</sup> This check has not been implemented yet. Instead, the deployment goes straight to `Running` after creating sub-resources.
 
-#### Deployment Conditions
+### Deployment Conditions
 
 PMEM-CSI `DeploymentStatus` has an array of `conditions` through which the
 PMEM-CSI Deployment has or has not passed. Below are the possible condition
@@ -1303,7 +1697,7 @@ types and their meanings:
 | CertsVerified | Verified that the provided certificates are valid. |
 | DriverDeployed | All the componentes required for the PMEM-CSI deployment have been deployed. |
 
-#### Driver component status
+### Driver component status
 
 PMEM-CSI `DeploymentStatus` has an array of `components` of type `DriverStatus`
 in which the operator records the brief driver components status. This is
@@ -1317,20 +1711,23 @@ Below are the fields and their meanings of `DriverStatus`:
 | reason | A brief message that explains why the component is in this state. |
 | lastUpdateTime | Time at which the status updated. |
 
-#### Deployment Events
+### Deployment Events
 
 The PMEM-CSI operator posts events on the progress of a `PmemCSIDeployment`. If the
 deployment is in the `Failed` state, then one can look into the event(s) using
 `kubectl describe` on that deployment for the detailed failure reason.
 
+### Operator metrics data
 
-> **Note on multiple deployments**
->
-> Though the operator allows running multiple PMEM-CSI driver deployments, one
-> has to take extreme care of such deployments by ensuring that not more than
-> one driver ends up running on the same node(s). Nodes on which a PMEM-CSI
-> driver could run can be configured by using `nodeSelector` property of
-> [`DeploymentSpec`](#deployment-crd-api).
+PMEM-CSI operator exposes below metrics data about active PmemCSIDeployment
+custom resources and it's sub-object in addition to the
+[metrics data provided by the controller-runtime](https://book-v1.book.kubebuilder.io/beyond_basics/controller_metrics.html):
+
+Name | Type | Explanation
+-----|------|------------
+`pmem_csi_deployment_reconcile` | counter | Counter that gets incremented on each time a PmemCSIDeployment CR gone through a reconcile loop, labeled with the deployment name and uid.
+`pmem_csi_deployment_sub_resource_created_at` | gauge | Timestamp at which a sub resource of the PmemCSIDeployment CR was created  by the operator. Labeled by resource details ("name, "namespace", "group", "version", "kind", "uid", "ownedBy").
+`pmem_csi_deployment_sub_resource_updated_at` | gauge | Timestamp at which a sub resource of the PmemCSIDeployment CR was updated by the operator. Labeled by resource details ("name, "namespace", "group", "version", "kind", "uid", "ownedBy").
 
 
 ## Filing issues and contributing

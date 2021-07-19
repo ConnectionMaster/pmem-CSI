@@ -9,10 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 package validate
 
 import (
-	"bytes"
 	"context"
-	"crypto/md5"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -24,11 +21,16 @@ import (
 	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1beta1"
 	"github.com/intel/pmem-csi/pkg/deployments"
 	operatordeployment "github.com/intel/pmem-csi/pkg/pmem-csi-operator/controller/deployment"
+	"github.com/intel/pmem-csi/pkg/pmem-csi-operator/metrics"
 	"github.com/intel/pmem-csi/pkg/version"
+	"github.com/intel/pmem-csi/test/e2e/deploy"
+	apierrs "k8s.io/apimachinery/pkg/api/errors"
 
+	cm "github.com/prometheus/client_model/go"
 	"gopkg.in/yaml.v2"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -36,60 +38,164 @@ import (
 // objects for a certain deployment spec. deploymentSpec should only have those fields
 // set which are not the defaults. This call will wait for the expected objects until
 // the context times out.
-func DriverDeploymentEventually(ctx context.Context, client client.Client, k8sver version.Version, namespace string, deployment api.PmemCSIDeployment, initialCreation bool) error {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
+func DriverDeploymentEventually(ctx context.Context, c *deploy.Cluster, client client.Client, k8sver version.Version, metricsURL, namespace string, deployment api.PmemCSIDeployment, expectedUpdates []client.Object, lastCount float64) (float64, error) {
 	if deployment.GetUID() == "" {
-		return errors.New("deployment not an object that was stored in the API server, no UID")
+		return 0, errors.New("deployment not an object that was stored in the API server, no UID")
+	}
+	endCount, err := WaitForDeploymentReconciled(ctx, c, metricsURL, deployment, lastCount)
+	if err != nil {
+		return 0, err
 	}
 
-	// Track resource versions to detect modifications?
-	var resourceVersions map[string]string
-	if initialCreation {
-		resourceVersions = map[string]string{}
+	// As the reconcile is done, check if the deployed driver is valid ...
+	if err := DriverDeployment(ctx, client, k8sver, namespace, deployment); err != nil {
+		return 0, err
+	}
+	// Now wait a bit longer to see whether the objects other than expected change again - they shouldn't.
+	// The longer we wait, the more certainty we have that we have reached a stable state.
+	if err := CheckForObjectUpdates(ctx, c, metricsURL, expectedUpdates, &deployment); err != nil {
+		return 0, err
+	}
+	return endCount, nil
+}
+
+// WaitForDeploymentReconciled waits and checks till the context timedout
+// that if given deployment got reconciled by the operator.
+// It checks in the operator metrics for a new 'pmem_csi_deployment_reconcile'
+// metric count is greater that the lastCount. If found it returns the new reconcile count.
+func WaitForDeploymentReconciled(ctx context.Context, c *deploy.Cluster, metricsURL string, deployment api.PmemCSIDeployment, lastCount float64) (float64, error) {
+	deploymentMap := map[string]string{
+		"name": deployment.Name,
+		"uid":  string(deployment.UID),
 	}
 
-	// TODO: once there is a better way to detect that the
-	// operator has finished updating the deployment, check for
-	// that here instead of repeatedly checking the objects.
-	// As it stands now, permanent differences will only be
-	// reported when the test times out.
-	ready := func() (final bool, err error) {
-		return DriverDeployment(client, k8sver, namespace, deployment, resourceVersions)
-	}
-	if final, err := ready(); err != nil {
-		if final {
-			return err
+	lblPairToMap := func(lbls []*cm.LabelPair) map[string]string {
+		res := map[string]string{}
+		for _, lbl := range lbls {
+			res[lbl.GetName()] = lbl.GetValue()
 		}
-	loop:
-		for {
-			select {
-			case <-ticker.C:
-				final, err = ready()
-				if err == nil {
-					break loop
+		return res
+	}
+
+	ready := func() (float64, error) {
+		name := "pmem_csi_deployment_reconcile"
+		mf, err := deploy.GetMetrics(ctx, c, metricsURL)
+		if err != nil {
+			return 0, err
+		}
+		metric, ok := mf[name]
+		if !ok {
+			return 0, fmt.Errorf("expected '%s' metric not found:\n %v", name, mf)
+		}
+
+		for _, m := range metric.GetMetric() {
+			if c := m.Counter.GetValue(); c > lastCount {
+				if reflect.DeepEqual(deploymentMap, lblPairToMap(m.GetLabel())) {
+					return c, nil
 				}
-				if final {
-					return err
-				}
-			case <-ctx.Done():
-				return fmt.Errorf("timed out waiting for deployment, last error: %v", err)
 			}
 		}
+		return 0, fmt.Errorf("'%s' metric not found with with count higher than %f", name, lastCount)
 	}
 
-	// Now wait a bit longer to see whether the objects change again - they shouldn't.
-	// The longer we wait, the more certainty we have that we have reached a stable state.
+	if endCount, err := ready(); err == nil {
+		return endCount, nil
+	}
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		select {
+		case <-ticker.C:
+			endCount, err := ready()
+			if err == nil {
+				return endCount, nil
+			}
+			lastErr = err
+		case <-ctx.Done():
+			return 0, fmt.Errorf("timed out waiting for deployment metric, last error: %v", lastErr)
+		}
+	}
+}
+
+// CheckForObjectUpdates wait and checks for deployed driver components
+// in consistent state. That means no unnecessary updates occurred and all
+// expected object updates passed in expectedUpdates have occurred.
+// It uses the 'pmem_csi_deployment_sub_resource_updated_at' metric.
+//
+// When the CR just got created, the operator should
+// immediately create objects with the right content and then
+// not update them again unless it is an expected update from the
+// caller.
+func CheckForObjectUpdates(ctx context.Context, c *deploy.Cluster, metricsURL string, expectedUpdates []client.Object, deployment *api.PmemCSIDeployment) error {
+	type updateInfo struct {
+		expectedObjectLabels []map[string]string
+		isFound              []bool
+	}
+
+	info := updateInfo{}
+	for _, o := range expectedUpdates {
+		info.expectedObjectLabels = append(info.expectedObjectLabels, metrics.GetSubResourceLabels(o))
+		info.isFound = append(info.isFound, false)
+	}
+
+	// isUpdateExpected check if the given object labels match with the
+	// expectedObjectLabels,
+	isUpdateExpected := func(labels map[string]string) bool {
+		for i, ol := range info.expectedObjectLabels {
+			if reflect.DeepEqual(ol, labels) {
+				info.isFound[i] = true
+				return true
+			}
+		}
+		return false
+	}
+
+	checkObjectUpdates := func() error {
+		mf, err := deploy.GetMetrics(ctx, c, metricsURL)
+		if err != nil {
+			return err
+		}
+		updates, ok := mf["pmem_csi_deployment_sub_resource_updated_at"]
+		if !ok {
+			return nil
+		}
+
+		unExpectedList := []string{}
+		for _, m := range updates.GetMetric() {
+			lblMap := labelPairToMap(m.GetLabel())
+			if strings.Contains(lblMap["ownedBy"], string(deployment.UID)) && !isUpdateExpected(lblMap) {
+				unExpectedList = append(unExpectedList, fmt.Sprintf("%+v", lblMap))
+			}
+		}
+
+		if len(unExpectedList) != 0 {
+			return fmt.Errorf("unexpected sub-object updates by the operator:\n%s", strings.Join(unExpectedList, "\n"))
+		}
+		return nil
+	}
+
 	deadline, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 	defer cancel()
 	for {
 		select {
 		case <-ticker.C:
-			if _, err := ready(); err != nil {
-				return fmt.Errorf("objects were changed after reaching expected state: %v", err)
+			// check if any updates recorded after last end of reconcile.
+			if err := checkObjectUpdates(); err != nil {
+				return err
 			}
 		case <-deadline.Done():
+			strList := []string{}
+			for i, l := range info.expectedObjectLabels {
+				if !info.isFound[i] {
+					strList = append(strList, fmt.Sprintf("%+v", l))
+				}
+			}
+			if len(strList) != 0 {
+				return fmt.Errorf("expected sub-object are not update by the operator: %s", strings.Join(strList, "\n"))
+			}
 			return nil
 		}
 	}
@@ -100,15 +206,11 @@ func DriverDeploymentEventually(ctx context.Context, client client.Client, k8sve
 // set which are not the defaults. The caller must ensure that the operator is done
 // with creating objects.
 //
-// resourceVersions is used to track which resource versions were encountered
-// for generated objects. If not nil, the version must not change (i.e. the operator
-// must not update the objects after creating them).
-//
 // A final error is returned when observing a problem that is not going to go away,
 // like an unexpected update of an object.
-func DriverDeployment(client client.Client, k8sver version.Version, namespace string, deployment api.PmemCSIDeployment, resourceVersions map[string]string) (final bool, finalErr error) {
+func DriverDeployment(ctx context.Context, c client.Client, k8sver version.Version, namespace string, deployment api.PmemCSIDeployment) error {
 	if deployment.GetUID() == "" {
-		return true, errors.New("deployment not an object that was stored in the API server, no UID")
+		return errors.New("deployment not an object that was stored in the API server, no UID")
 	}
 
 	// The operator currently always uses the production image. We
@@ -117,34 +219,42 @@ func DriverDeployment(client client.Client, k8sver version.Version, namespace st
 	(&deployment).EnsureDefaults(driverImage)
 
 	// Validate sub-objects. A sub-object is anything that has the deployment object as owner.
-	objects, err := listAllDeployedObjects(client, deployment, namespace)
+	objects, err := listAllDeployedObjects(ctx, c, deployment, namespace)
 	if err != nil {
-		return false, err
+		return err
 	}
 
-	expectedObjects, err := deployments.LoadAndCustomizeObjects(k8sver, deployment.Spec.DeviceMode, namespace, deployment)
+	// Load secret if it exists. If it doesn't, we validate without it.
+	var controllerCABundle []byte
+	if deployment.Spec.ControllerTLSSecret != "" {
+		secret := &corev1.Secret{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "v1",
+				Kind:       "Secret",
+			},
+		}
+		objKey := client.ObjectKey{
+			Namespace: namespace,
+			Name:      deployment.Spec.ControllerTLSSecret,
+		}
+		if err := c.Get(ctx, objKey, secret); err != nil {
+			if !apierrs.IsNotFound(err) {
+				return err
+			}
+		} else {
+			if ca, ok := secret.Data[api.TLSSecretCA]; ok {
+				controllerCABundle = ca
+			}
+		}
+	}
+
+	expectedObjects, err := deployments.LoadAndCustomizeObjects(k8sver, deployment.Spec.DeviceMode, namespace, deployment, controllerCABundle)
 	if err != nil {
-		return true, fmt.Errorf("customize expected objects: %v", err)
+		return fmt.Errorf("customize expected objects: %v", err)
 	}
 
 	var diffs []string
 	for _, actual := range objects {
-		// When the CR just got created, the operator should
-		// immediately create objects with the right content and then
-		// not update them again.
-		if resourceVersions != nil {
-			uid := string(actual.GetUID())
-			currentResourceVersion := actual.GetResourceVersion()
-			oldResourceVersion, ok := resourceVersions[uid]
-			if ok {
-				if oldResourceVersion != currentResourceVersion {
-					diffs = append(diffs, fmt.Sprintf("object was modified unnecessarily: %s", prettyPrintObjectID(actual)))
-					final = true
-				}
-			} else {
-				resourceVersions[uid] = currentResourceVersion
-			}
-		}
 		expected := findObject(expectedObjects, actual)
 		if expected == nil {
 			diffs = append(diffs, fmt.Sprintf("unexpected object was deployed: %s", prettyPrintObjectID(actual)))
@@ -202,57 +312,9 @@ func DriverDeployment(client client.Client, k8sver version.Version, namespace st
 		}
 	}
 	if diffs != nil {
-		finalErr = fmt.Errorf("deployed driver different from expected deployment:\n%s", strings.Join(diffs, "\n"))
-	}
-	return
-}
-
-func createObject(gvk schema.GroupVersionKind, name, namespace string) unstructured.Unstructured {
-	var obj unstructured.Unstructured
-	obj.SetGroupVersionKind(gvk)
-	obj.SetName(name)
-	obj.SetNamespace(namespace)
-
-	return obj
-}
-
-func compareSecrets(actual unstructured.Unstructured, ca, key, crt []byte) (diffs []string) {
-	data := actual.Object["data"]
-	if data == nil {
-		return []string{fmt.Sprintf("%s: no data in secret", actual.GetName())}
-	}
-	fields := data.(map[string]interface{})
-	diffs = append(diffs, compareSecretField(actual.GetName(), fields, "ca.crt", ca)...)
-	diffs = append(diffs, compareSecretField(actual.GetName(), fields, "tls.key", key)...)
-	diffs = append(diffs, compareSecretField(actual.GetName(), fields, "tls.crt", crt)...)
-	return
-}
-
-func compareSecretField(name string, fields map[string]interface{}, fieldName string, expectedData []byte) []string {
-	field := fields[fieldName]
-	if field == nil {
-		return []string{fmt.Sprintf("secret %s does not contain data field %s", name, fieldName)}
-	}
-	actualData, err := base64.StdEncoding.DecodeString(field.(string))
-	if err != nil {
-		return []string{fmt.Sprintf("decoding secret %s field %s: %v", name, fieldName, err)}
-	}
-	if expectedData == nil {
-		// We only know that there should be some data, but not what it should be.
-		if len(actualData) == 0 {
-			return []string{fmt.Sprintf("secret %s contains empty data field %s", name, fieldName)}
-		}
-	} else {
-		if bytes.Compare(actualData, expectedData) != 0 {
-			return []string{fmt.Sprintf("secret %s, field %s: data mismatch: got %s, expected %s",
-				name, fieldName, summarizeData(actualData), summarizeData(expectedData))}
-		}
+		return fmt.Errorf("deployed driver different from expected deployment:\n%s", strings.Join(diffs, "\n"))
 	}
 	return nil
-}
-
-func summarizeData(data []byte) string {
-	return fmt.Sprintf("len %d, hash %x", len(data), md5.Sum(data))
 }
 
 // When we get an object back from the apiserver, some fields get populated with generated
@@ -301,7 +363,11 @@ func parseDefaultValues() map[string]interface{} {
 Service:
   spec:
     clusterIP: ignore
+    clusterIPs: ignore # since k8s v1.20
     externalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
     ports:
       protocol: TCP
       nodePort: ignore
@@ -311,27 +377,33 @@ Service:
     type: ClusterIP
 ServiceAccount:
   secrets: ignore
+  imagePullSecrets: ignore # injected on OpenShift
 DaemonSet:` + defaultsApps + `
     updateStrategy: ignore
+Deployment:` + defaultsApps + `
+    progressDeadlineSeconds: ignore
+    strategy: ignore
 StatefulSet:` + defaultsApps + `
     updateStrategy: ignore
 CSIDriver:
   spec:
     storageCapacity: false
+    fsGroupPolicy: ignore # currently PMEM-CSI driver does not support fsGroupPolicy
+    requiresRepublish: false
 MutatingWebhookConfiguration:
   webhooks:
     clientConfig:
-      caBundle: ignore # content varies, correctness is validated during E2E testing
+      caBundle: ignore # Can change, in particular when generated by OpenShift.
       service:
         port: 443
     admissionReviewVersions:
     - v1beta1
-    matchPolicy: Exact
+    matchPolicy: Equivalent # default policy in v1
     reinvocationPolicy: Never
     rules:
       scope: "*"
     sideEffects: Unknown
-    timeoutSeconds: 30
+    timeoutSeconds: 10 # default timeout in v1
 `
 
 	err := yaml.UnmarshalStrict([]byte(defaultsYAML), &defaults)
@@ -487,7 +559,7 @@ func prettyPrintObjectID(object unstructured.Unstructured) string {
 		object.GetNamespace())
 }
 
-func listAllDeployedObjects(c client.Client, deployment api.PmemCSIDeployment, namespace string) ([]unstructured.Unstructured, error) {
+func listAllDeployedObjects(ctx context.Context, c client.Client, deployment api.PmemCSIDeployment, namespace string) ([]unstructured.Unstructured, error) {
 	objects := []unstructured.Unstructured{}
 
 	for _, list := range operatordeployment.AllObjectLists() {
@@ -502,7 +574,7 @@ func listAllDeployedObjects(c client.Client, deployment api.PmemCSIDeployment, n
 		}
 		// Filtering by owner doesn't work, so we have to use brute-force and look at all
 		// objects.
-		if err := c.List(context.Background(), list, opts); err != nil {
+		if err := c.List(ctx, list, opts); err != nil {
 			return objects, fmt.Errorf("list %s: %v", list.GetObjectKind(), err)
 		}
 	outer:
@@ -517,4 +589,13 @@ func listAllDeployedObjects(c client.Client, deployment api.PmemCSIDeployment, n
 		}
 	}
 	return objects, nil
+}
+
+func labelPairToMap(pairs []*cm.LabelPair) map[string]string {
+	labels := map[string]string{}
+	for _, lbl := range pairs {
+		labels[lbl.GetName()] = lbl.GetValue()
+	}
+
+	return labels
 }

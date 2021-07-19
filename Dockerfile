@@ -1,3 +1,7 @@
+# Copyright 2021 Intel Coporation.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Image builds are not reproducible because the base layer is changing over time.
 ARG LINUX_BASE=debian:buster-slim
 
@@ -5,17 +9,20 @@ ARG LINUX_BASE=debian:buster-slim
 FROM ${LINUX_BASE} AS build
 ARG APT_GET="env DEBIAN_FRONTEND=noninteractive apt-get"
 
-ARG GO_VERSION="1.15.2"
+ARG GO_VERSION="1.16.1"
 
 # CACHEBUST is set by the CI when building releases to ensure that apt-get really gets
 # run instead of just using some older, cached result.
 ARG CACHEBUST
 
+# We want newer ndctl that is available in buster:
+RUN echo 'deb http://ftp.debian.org/debian buster-backports main' > /etc/apt/sources.list.d/buster-backports.list
+RUN echo 'deb-src http://ftp.debian.org/debian buster-backports main' >> /etc/apt/sources.list.d/buster-backports.list
 # In contrast to the runtime image below, here we can afford to install additional
 # tools and recommended packages. But this image gets pushed to a registry by the CI as a cache,
 # so it still makes sense to keep this layer small by removing /var/cache.
 RUN ${APT_GET} update && \
-    ${APT_GET} install -y gcc libndctl-dev make git curl iproute2 pkg-config xfsprogs e2fsprogs parted openssh-client python3 python3-venv equivs && \
+    ${APT_GET} install -y gcc libndctl-dev/buster-backports make git curl iproute2 pkg-config xfsprogs e2fsprogs parted openssh-client python3 python3-venv equivs debhelper cmake python asciidoctor pkg-config && \
     rm -rf /var/cache/*
 RUN curl -L https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz | tar -zxf - -C / && \
     mkdir -p /usr/local/bin/ && \
@@ -25,6 +32,20 @@ ADD hack/python3-fake-debian-package .
 
 # Creates python3_100.0_all.deb
 RUN equivs-build python3-fake-debian-package
+
+# Build ipmctl from source.
+# We use the latest official release and determine that via
+# the HTML redirect page.
+RUN set -x && \
+    git clone https://github.com/intel/ipmctl.git && \
+    cd ipmctl && \
+    tag=$(curl --silent https://github.com/intel/ipmctl/releases/latest | sed -e 's;.*tag/\([^"]*\).*;\1;') && \
+    git checkout $tag && \
+    mkdir build && \
+    cd build && \
+    cmake -DRELEASE=ON -DCMAKE_INSTALL_PREFIX=/usr/local .. && \
+    make -j all && \
+    make install
 
 # Clean image for deploying PMEM-CSI.
 FROM ${LINUX_BASE} as runtime
@@ -42,11 +63,13 @@ COPY --from=build python3_100.0_all.deb /var/cache/python3_100.0_all.deb
 # xfsprogs, e2fsprogs - formating filesystems
 # lvm2 - volume management
 # ndctl - pulls in the necessary library, useful by itself
-# fio - only included in testing images
+# parted - for Kata Containers support
+RUN echo 'deb http://ftp.debian.org/debian buster-backports main' > /etc/apt/sources.list.d/buster-backports.list
+RUN echo 'deb-src http://ftp.debian.org/debian buster-backports main' >> /etc/apt/sources.list.d/buster-backports.list
 RUN ${APT_GET} update && \
     mkdir -p /usr/local/share && \
     dpkg -i /var/cache/python3_100.0_all.deb && \
-    bash -c 'set -o pipefail; ${APT_GET} install -y --no-install-recommends file xfsprogs e2fsprogs lvm2 ndctl \
+    bash -c 'set -o pipefail; ${APT_GET} install -y --no-install-recommends file xfsprogs e2fsprogs lvm2 libndctl-dev/buster-backports ndctl/buster-backports parted \
        | tee --append /usr/local/share/package-install.log' && \
     rm -rf /var/cache/*
 
@@ -110,7 +133,7 @@ RUN cd /usr/local/share/package-sources && \
         else \
             echo "    $pkg"; \
         fi; \
-    done | sort -u; \
+    done && \
     rm -rf /var/cache/*
 
 # build pmem-csi-driver
@@ -153,13 +176,20 @@ RUN set -x && \
     ls -l /usr/local/share/package-sources; \
     du -h /usr/local/share/package-sources
 
+COPY --from=build /ipmctl/LICENSE /usr/local/share/package-licenses/ipmctl.LICENSE
+
 # The actual pmem-csi-driver image.
 FROM runtime as pmem
 
 # Move required binaries and libraries to clean container.
-COPY --from=binaries /usr/local/bin/pmem-* /usr/local/bin/
+COPY --from=binaries /usr/local/bin/pmem-* /usr/local/bin/ipmctl /usr/local/bin/
+COPY --from=binaries /usr/local/lib/libipmctl*.so.* /usr/local/lib/
+COPY --from=binaries /usr/local/man /usr/local/man
 COPY --from=binaries /usr/local/share/package-licenses /usr/local/share/package-licenses
 COPY --from=binaries /usr/local/share/package-sources /usr/local/share/package-sources
+
+# /usr/local/lib is not in the default library search path.
+RUN for i in /usr/local/lib/*.so.*; do ln -s $i /usr/lib; done
 
 # Don't rely on udevd, it isn't available (https://unix.stackexchange.com/questions/591724/how-to-add-a-block-to-udev-database-that-works-after-reboot).
 # Same with D-Bus.
@@ -176,7 +206,3 @@ RUN sed -i \
         /etc/lvm/lvm.conf
 
 ENV LD_LIBRARY_PATH=/usr/lib
-# By default container runs with non-root user
-# Choose root user explicitly only where needed, like - node driver
-RUN useradd --uid 1000 --user-group --shell /bin/bash pmem-csi
-USER 1000

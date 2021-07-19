@@ -29,7 +29,7 @@ import (
 	"github.com/intel/pmem-csi/test/e2e/operator/validate"
 
 	corev1 "k8s.io/api/core/v1"
-	storagev1beta1 "k8s.io/api/storage/v1beta1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -54,6 +54,7 @@ type pmemDeployment struct {
 	logFormat                                           string
 	image, pullPolicy, provisionerImage, registrarImage string
 	controllerCPU, controllerMemory                     string
+	controllerReplicas                                  int
 	nodeCPU, nodeMemory                                 string
 	provisionerCPU, provisionerMemory                   string
 	nodeRegistarCPU, nodeRegistrarMemory                string
@@ -96,6 +97,7 @@ func getDeployment(d *pmemDeployment) *api.PmemCSIDeployment {
 		SchedulerNodePort:   d.schedulerNodePort,
 	}
 	spec := &dep.Spec
+	spec.ControllerReplicas = d.controllerReplicas
 	if d.controllerCPU != "" || d.controllerMemory != "" {
 		spec.ControllerDriverResources = &corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
@@ -203,7 +205,7 @@ func deleteDeployment(c client.Client, name, ns string) error {
 	// This is supposed to handle by Kubernetes grabage collector
 	// but couldn't provided by fake client the tets are using
 	//
-	driver := &storagev1beta1.CSIDriver{
+	driver := &storagev1.CSIDriver{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: dep.Name,
 		},
@@ -351,12 +353,7 @@ func TestDeploymentController(t *testing.T) {
 				dep.Spec.Image = testDriverImage
 			}
 
-			// If the CR was not updated, then objects should still be the same as they were initially.
-			rv := tc.resourceVersions
-			if wasUpdated {
-				rv = nil
-			}
-			_, err := validate.DriverDeployment(tc.c, testK8sVersion, testNamespace, *dep, rv)
+			err := validate.DriverDeployment(tc.ctx, tc.c, testK8sVersion, testNamespace, *dep)
 			require.NoError(tc.t, err, "validate deployment")
 			validateEvents(tc, dep, expectedEvents)
 		}
@@ -370,75 +367,80 @@ func TestDeploymentController(t *testing.T) {
 		}
 
 		cases := map[string]pmemDeployment{
-			"deployment with defaults": pmemDeployment{
+			"deployment with defaults": {
 				name: "test-deployment",
 			},
-			"deployment with explicit values": pmemDeployment{
-				name:             "test-deployment",
-				image:            "test-driver:v0.0.0",
-				provisionerImage: "test-provisioner-image:v0.0.0",
-				registrarImage:   "test-driver-registrar-image:v.0.0.0",
-				pullPolicy:       "Never",
-				logLevel:         10,
-				logFormat:        "json",
-				controllerCPU:    "1500m",
-				controllerMemory: "300Mi",
-				nodeCPU:          "1000m",
-				nodeMemory:       "500Mi",
-				kubeletDir:       "/some/directory",
+			"deployment with explicit values": {
+				name:               "test-deployment",
+				image:              "test-driver:v0.0.0",
+				provisionerImage:   "test-provisioner-image:v0.0.0",
+				registrarImage:     "test-driver-registrar-image:v.0.0.0",
+				pullPolicy:         "Never",
+				logLevel:           10,
+				logFormat:          "json",
+				controllerCPU:      "1500m",
+				controllerMemory:   "300Mi",
+				controllerReplicas: 4,
+				nodeCPU:            "1000m",
+				nodeMemory:         "500Mi",
+				kubeletDir:         "/some/directory",
 			},
-			"invalid device mode": pmemDeployment{
+			"invalid device mode": {
 				name:          "test-driver-modes",
 				deviceMode:    "foobar",
 				expectFailure: true,
 			},
-			"LVM mode": pmemDeployment{
+			"LVM mode": {
 				name:       "test-driver-modes",
 				deviceMode: "lvm",
 			},
-			"direct mode": pmemDeployment{
+			"direct mode": {
 				name:       "test-driver-modes",
 				deviceMode: "direct",
 			},
-			"with controller, no secret": pmemDeployment{
+			"with controller, no secret": {
 				name:                "test-controller",
 				controllerTLSSecret: "controller-secret",
 				expectFailure:       true,
 			},
-			"with controller, wrong secret content": pmemDeployment{
+			"with controller, wrong secret content": {
 				name:                "test-controller",
 				controllerTLSSecret: "controller-secret",
 				objects:             []runtime.Object{createSecret("controller-secret", testNamespace, nil)},
 				expectFailure:       true,
 			},
-			"with controller, secret okay": pmemDeployment{
+			"with controller, secret okay": {
 				name:                "test-controller",
 				controllerTLSSecret: "controller-secret",
 				objects:             []runtime.Object{createSecret("controller-secret", testNamespace, dataOkay)},
 			},
-			"controller, no mutate": pmemDeployment{
+			"controller, no mutate": {
 				name:                "test-controller",
 				controllerTLSSecret: "controller-secret",
 				mutatePods:          api.MutatePodsNever,
 				objects:             []runtime.Object{createSecret("controller-secret", testNamespace, dataOkay)},
 			},
-			"controller, try mutate": pmemDeployment{
+			"controller, try mutate": {
 				name:                "test-controller",
 				controllerTLSSecret: "controller-secret",
 				mutatePods:          api.MutatePodsTry,
 				objects:             []runtime.Object{createSecret("controller-secret", testNamespace, dataOkay)},
 			},
-			"controller, always mutate": pmemDeployment{
+			"controller, always mutate": {
 				name:                "test-controller",
 				controllerTLSSecret: "controller-secret",
 				mutatePods:          api.MutatePodsAlways,
 				objects:             []runtime.Object{createSecret("controller-secret", testNamespace, dataOkay)},
 			},
-			"controller, port 31000": pmemDeployment{
+			"controller, port 31000": {
 				name:                "test-controller",
 				controllerTLSSecret: "controller-secret",
 				schedulerNodePort:   31000,
 				objects:             []runtime.Object{createSecret("controller-secret", testNamespace, dataOkay)},
+			},
+			"openshift": {
+				name:                "test-controller",
+				controllerTLSSecret: "-openshift-",
 			},
 		}
 
@@ -540,7 +542,7 @@ func TestDeploymentController(t *testing.T) {
 			for _, testcase := range testcases.UpdateTests() {
 				testcase := testcase
 				t.Run(testcase.Name, func(t *testing.T) {
-					testIt := func(restart bool) {
+					testIt := func(t *testing.T, restart bool) {
 						tc := setup(t)
 						defer teardown(tc)
 						dep := testcase.Deployment.DeepCopyObject().(*api.PmemCSIDeployment)
@@ -588,11 +590,11 @@ func TestDeploymentController(t *testing.T) {
 					t.Parallel()
 
 					t.Run("while running", func(t *testing.T) {
-						testIt(false)
+						testIt(t, false)
 					})
 
 					t.Run("while stopped", func(t *testing.T) {
-						testIt(true)
+						testIt(t, true)
 					})
 				})
 			}
@@ -722,11 +724,6 @@ func TestDeploymentController(t *testing.T) {
 	}
 }
 
-// patchMutex is used to serialize the patch operation because
-// of concurrency issues in controller-runtime and/or json-iterator
-// (https://github.com/intel/pmem-csi/issues/852).
-var patchMutex sync.Mutex
-
 type testClient struct {
 	client.Client
 	assertOn *schema.GroupVersionKind
@@ -748,10 +745,4 @@ func (t *testClient) Create(ctx context.Context, obj client.Object, opts ...clie
 		panic(fmt.Sprintf("assert: %v", obj.GetObjectKind()))
 	}
 	return t.Client.Create(ctx, obj, opts...)
-}
-
-func (t *testClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-	patchMutex.Lock()
-	defer patchMutex.Unlock()
-	return t.Client.Patch(ctx, obj, patch, opts...)
 }

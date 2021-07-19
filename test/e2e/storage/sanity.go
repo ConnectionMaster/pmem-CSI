@@ -21,6 +21,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"regexp"
@@ -31,8 +32,9 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1beta1"
-	"github.com/kubernetes-csi/csi-test/v3/pkg/sanity"
-	sanityutils "github.com/kubernetes-csi/csi-test/v3/utils"
+	"github.com/intel/pmem-csi/pkg/logger"
+	"github.com/intel/pmem-csi/pkg/logger/testinglogger"
+	"github.com/kubernetes-csi/csi-test/v4/pkg/sanity"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
@@ -42,15 +44,21 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/clock"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	clientexec "k8s.io/client-go/util/exec"
+	"k8s.io/klog/v2/klogr"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	"k8s.io/kubernetes/test/e2e/framework/skipper"
-	testutils "k8s.io/kubernetes/test/utils"
 
+	pmemexec "github.com/intel/pmem-csi/pkg/exec"
+	pmemlog "github.com/intel/pmem-csi/pkg/logger"
+	"github.com/intel/pmem-csi/pkg/pmem-csi-driver/parameters"
 	"github.com/intel/pmem-csi/test/e2e/deploy"
+	"github.com/intel/pmem-csi/test/e2e/pod"
+	pmeme2epod "github.com/intel/pmem-csi/test/e2e/pod"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -70,16 +78,22 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 	// This is not the case when deployed in production mode.
 	return d.Testing
 }, func(d *deploy.Deployment) {
-	config := sanity.NewTestConfig()
-	config.TestVolumeSize = 1 * 1024 * 1024
-	// The actual directories will be created as unique
-	// temp directories inside these directories.
-	// We intentionally do not use the real /var/lib/kubelet/pods as
-	// root for the target path, because kubelet is monitoring it
-	// and deletes all extra entries that it does not know about.
-	config.TargetPath = "/var/lib/kubelet/plugins/kubernetes.io/csi/pv/pmem-sanity-target.XXXXXX"
-	config.StagingPath = "/var/lib/kubelet/plugins/kubernetes.io/csi/pv/pmem-sanity-staging.XXXXXX"
-	config.ControllerDialOptions = []grpc.DialOption{
+	// This must be set before the grpcDialer gets used for the first time.
+	var cfg *rest.Config
+	var cs kubernetes.Interface
+	grpcDialer := func(ctx context.Context, address string) (net.Conn, error) {
+		addr, err := pod.ParseAddr(address)
+		if err != nil {
+			return nil, err
+		}
+		cs, err := kubernetes.NewForConfig(cfg)
+		if err != nil {
+			return nil, err
+		}
+		dialer := pod.NewDialer(cs, cfg)
+		return dialer.DialContainerPort(ctx, klogr.New().WithName("gRPC socat"), *addr)
+	}
+	dialOptions := []grpc.DialOption{
 		// For our restart tests.
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			PermitWithoutStream: true,
@@ -89,7 +103,28 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 		}),
 		// For plain HTTP.
 		grpc.WithInsecure(),
+		// Connect to socat pods through port-forwarding.
+		grpc.WithContextDialer(grpcDialer),
 	}
+
+	config := sanity.NewTestConfig()
+	// The size has to be large enough that even after rounding up to
+	// the next alignment boundary, the final volume size is still about
+	// the same. The "should fail when requesting to create a volume with already existing name and different capacity"
+	// test assumes that doubling the size will be too large to reuse the
+	// already created volume.
+	//
+	// In practice, the largest alignment that we have seen is 96MiB.
+	config.TestVolumeSize = 96 * 1024 * 1024
+	// The actual directories will be created as unique
+	// temp directories inside these directories.
+	// We intentionally do not use the real /var/lib/kubelet/pods as
+	// root for the target path, because kubelet is monitoring it
+	// and deletes all extra entries that it does not know about.
+	config.TargetPath = "/var/lib/kubelet/plugins/kubernetes.io/csi/pv/pmem-sanity-target.XXXXXX"
+	config.StagingPath = "/var/lib/kubelet/plugins/kubernetes.io/csi/pv/pmem-sanity-staging.XXXXXX"
+	config.DialOptions = dialOptions
+	config.ControllerDialOptions = dialOptions
 
 	f := framework.NewDefaultFramework("pmem")
 	f.SkipNamespaceCreation = true // We don't need a per-test namespace and skipping it makes the tests run faster.
@@ -97,14 +132,20 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 	var cleanup func()
 	var cluster *deploy.Cluster
 
+	// Always test on the second node. We assume it has PMEM.
+	const testNode = 1
+
 	BeforeEach(func() {
-		cs := f.ClientSet
+		// Store them for grpcDialer above. We cannot let it reference f itself because
+		// f.ClientSet gets unset at some point.
+		cs = f.ClientSet
+		cfg = f.ClientConfig()
 
 		var err error
-		cluster, err = deploy.NewCluster(cs, f.DynamicClient)
+		cluster, err = deploy.NewCluster(cs, f.DynamicClient, f.ClientConfig())
 		framework.ExpectNoError(err, "query cluster")
 
-		config.Address, config.ControllerAddress, err = deploy.LookupCSIAddresses(cluster, d.Namespace)
+		config.Address, config.ControllerAddress, err = deploy.LookupCSIAddresses(context.Background(), cluster, d.Namespace)
 		framework.ExpectNoError(err, "find CSI addresses")
 
 		framework.Logf("sanity: using controller %s and node %s", config.ControllerAddress, config.Address)
@@ -132,7 +173,7 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 				"app.kubernetes.io/component": "node-testing",
 				"app.kubernetes.io/part-of":   "pmem-csi",
 			},
-				cluster.NodeIP(1), d.Namespace)
+				cluster.NodeIP(testNode), d.Namespace)
 			return socat
 		}
 
@@ -175,11 +216,30 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 			execOnTestNode("rmdir", path)
 			return nil
 		}
+		checkpath := func(path string) (sanity.PathKind, error) {
+			out := execOnTestNode("/bin/sh", "-c", fmt.Sprintf(`
+if [ -f '%s' ]; then
+    echo file;
+elif [ -d '%s' ]; then
+    echo directory;
+elif [ -e '%s' ]; then
+    echo other;
+else
+    echo not_found;
+fi
+`, path, path, path))
+			kind, err := sanity.IsPathKind(out)
+			if err != nil {
+				return "", fmt.Errorf("unexpected output from node shell script: %v", err)
+			}
+			return kind, nil
+		}
 
 		config.CreateTargetDir = mkdir
 		config.CreateStagingDir = mkdir
 		config.RemoveTargetPath = rmdir
 		config.RemoveStagingPath = rmdir
+		config.CheckPath = checkpath
 	})
 
 	AfterEach(func() {
@@ -214,13 +274,13 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 
 	var _ = Describe("PMEM-CSI", func() {
 		var (
-			cl       *sanity.Cleanup
-			nc       csi.NodeClient
-			cc, ncc  csi.ControllerClient
-			nodeID   string
-			v        volume
-			cancel   func()
-			rebooted bool
+			resources *sanity.Resources
+			nc        csi.NodeClient
+			cc, ncc   csi.ControllerClient
+			nodeID    string
+			v         volume
+			cancel    func()
+			rebooted  bool
 		)
 
 		BeforeEach(func() {
@@ -228,7 +288,7 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 			nc = csi.NewNodeClient(sc.Conn)
 			cc = csi.NewControllerClient(sc.ControllerConn)
 			ncc = csi.NewControllerClient(sc.Conn) // This works because PMEM-CSI exposes the node, controller, and ID server via its csi.sock.
-			cl = &sanity.Cleanup{
+			resources = &sanity.Resources{
 				Context:                    sc,
 				NodeClient:                 nc,
 				ControllerClient:           cc,
@@ -250,12 +310,12 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 				sc:         sc,
 				cc:         cc,
 				nc:         nc,
-				cl:         cl,
+				resources:  resources,
 			}
 		})
 
 		AfterEach(func() {
-			cl.DeleteVolumes()
+			resources.Cleanup()
 			cancel()
 			sc.Teardown()
 
@@ -273,14 +333,25 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 			}
 		})
 
+		deleteTestNodeDriver := func() error {
+			nodeDriverPod, err := cluster.GetAppInstance(context.Background(), labels.Set{
+				"app.kubernetes.io/name": "pmem-csi-node",
+			}, cluster.NodeIP(testNode), d.Namespace)
+			if err != nil {
+				return fmt.Errorf("node driver pod not found on node %d: %v", testNode, err)
+			}
+			if err := e2epod.DeletePodWithWaitByName(f.ClientSet, nodeDriverPod.Name, nodeDriverPod.Namespace); err != nil {
+				return fmt.Errorf("delete driver pod on node %d: %v", testNode, err)
+			}
+			return nil
+		}
+
 		It("stores state across reboots for single volume", func() {
 			canRestartNode(nodeID)
 
 			execOnTestNode("sync")
 			v.namePrefix = "state-volume"
 
-			// We intentionally check the state of the controller on the node here.
-			// The master caches volumes and does not get rebooted.
 			initialVolumes, err := ncc.ListVolumes(context.Background(), &csi.ListVolumesRequest{})
 			framework.ExpectNoError(err, "list volumes")
 
@@ -331,12 +402,8 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 		})
 
 		It("can publish volume after a node driver restart", func() {
-			restartPod := ""
+			var err error
 			v.namePrefix = "mount-volume"
-
-			pods, err := WaitForPodsWithLabelRunningReady(f.ClientSet, d.Namespace,
-				labels.Set{"app.kubernetes.io/name": "pmem-csi-node"}.AsSelector(), cluster.NumNodes()-1, time.Minute)
-			framework.ExpectNoError(err, "All node drivers are not ready")
 
 			name, vol := v.create(22*1024*1024, nodeID)
 			defer v.remove(vol, name)
@@ -344,30 +411,108 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 			nodeID := v.publish(name, vol)
 			defer v.unpublish(vol, nodeID)
 
-			for _, p := range pods.Items {
-				if p.Spec.NodeName == nodeID {
-					restartPod = p.Name
-				}
-			}
+			capacityBefore, err := cc.GetCapacity(context.Background(), &csi.GetCapacityRequest{})
+			framework.ExpectNoError(err, "get capacity before restart")
 
 			// delete driver on node
-			err = e2epod.DeletePodWithWaitByName(f.ClientSet, d.Namespace, restartPod)
-			Expect(err).ShouldNot(HaveOccurred(), "Failed to stop driver pod %s", restartPod)
+			err = deleteTestNodeDriver()
+			framework.ExpectNoError(err)
 
-			// Wait till the driver pod get restarted
-			err = e2epod.WaitForPodsReady(f.ClientSet, d.Namespace, restartPod, time.Now().Minute())
-			framework.ExpectNoError(err, "Node driver '%s' pod is not ready", restartPod)
+			// Eventually a different pod will be created and listing volumes will
+			// work again through the same socat pod as before.
+			Eventually(func() error {
+				_, err = ncc.ListVolumes(context.Background(), &csi.ListVolumesRequest{})
+				return err
+			}, "3m", "5s").ShouldNot(HaveOccurred(), "Failed to list volumes after restart of node driver")
 
-			_, err = ncc.ListVolumes(context.Background(), &csi.ListVolumesRequest{})
-			framework.ExpectNoError(err, "Failed to list volumes after reboot")
+			capacityAfter, err := cc.GetCapacity(context.Background(), &csi.GetCapacityRequest{})
+			framework.ExpectNoError(err, "get capacity after restart")
+			Expect(capacityAfter).To(Equal(capacityBefore), "capacity changed because node driver was restarted")
 
 			// Try republish
 			v.publish(name, vol)
 		})
 
+		It("LVM volume group expands during restart", func() {
+			// We cannot reconfigure the driver. But we can destroy the volume group and namespace,
+			// create a smaller namespace, then restart the driver. The result should be a volume
+			// group containing two namespaces.
+
+			if d.Mode != api.DeviceModeLVM {
+				skipper.Skipf("test only works in LVM mode")
+			}
+
+			capacityBefore, err := cc.GetCapacity(context.Background(), &csi.GetCapacityRequest{})
+			framework.ExpectNoError(err, "get capacity before restart")
+
+			defer func() {
+				// Always clean up.
+				By("destroying volume groups and namespaces again")
+				if err := deploy.ResetPMEM(context.Background(), fmt.Sprintf("%d", testNode)); err != nil {
+					framework.Logf("resetting PMEM during cleanup failed: %v", err)
+				}
+
+				// We need to delete the pod to ensure that it detects those changes.
+				if err := deleteTestNodeDriver(); err != nil {
+					framework.Logf("deleting test node driver during cleanup failed: %v", err)
+				}
+			}()
+
+			sshcmd := fmt.Sprintf("%s/_work/%s/ssh.%d", os.Getenv("REPO_ROOT"), os.Getenv("CLUSTER"), testNode)
+			mustRun := func(cmd string) {
+				_, err := pmemexec.RunCommand(context.Background(), sshcmd, cmd)
+				framework.ExpectNoError(err)
+			}
+			dump := func() {
+				mustRun("sudo vgs")
+				mustRun("sudo pvs")
+				mustRun("sudo ndctl list -NRu")
+			}
+
+			// This runs twice, because it was observed that it worked once on a clean
+			// node and then failed when run again. The reason where some lingering LVM
+			// labels in the namespace device, presumably from a previous run. Now PMEM-CSI
+			// wipes created namespaces, which avoids this issue.
+			for i := 0; i < 2; i++ {
+				By(fmt.Sprintf("Test iteration #%d", i))
+
+				err = deploy.ResetPMEM(context.Background(), fmt.Sprintf("%d", testNode))
+				framework.ExpectNoError(err, "reset during iteration #%d", i)
+
+				// Create a small namespace and the corresponding volume group, as if the driver
+				// had been started before with a small percentage.
+				mustRun("sudo ndctl create-namespace -s 96M --name pmem-csi")
+				mustRun("sudo wipefs -a -f /dev/pmem0")
+				mustRun("sudo vgcreate -f ndbus0region0fsdax /dev/pmem0")
+				dump()
+
+				// Force it to restart.
+				err = deleteTestNodeDriver()
+				framework.ExpectNoError(err, "delete node driver during iteration #%d", i)
+
+				// Once the driver restarts, it should extend that existing volume group
+				// before responding to gRPC requests.
+				var capacityAfter *csi.GetCapacityResponse
+				Eventually(func() error {
+					resp, err := cc.GetCapacity(context.Background(), &csi.GetCapacityRequest{})
+					if err != nil {
+						return err
+					}
+					capacityAfter = resp
+					return nil
+				}, "3m", "5s").ShouldNot(HaveOccurred(), "get capacity after restart #%d", i)
+				dump()
+
+				// Capacity is going to be a bit lower due to some additional overhead for
+				// managing two PVs instead of one.
+				Expect(capacityAfter.AvailableCapacity).To(BeNumerically("<", capacityBefore.AvailableCapacity), "capacity not less than before during iteration #%d", i)
+				Expect(capacityAfter.AvailableCapacity).To(BeNumerically(">=", capacityBefore.AvailableCapacity*95/100), "less capacity than expected during iteration #%d", i)
+			}
+		})
+
 		It("capacity is restored after controller restart", func() {
 			By("Fetching pmem-csi-controller pod name")
-			pods, err := WaitForPodsWithLabelRunningReady(f.ClientSet, d.Namespace,
+			pods, err := e2epod.WaitForPodsWithLabelRunningReady(f.ClientSet, d.Namespace,
 				labels.Set{"app.kubernetes.io/name": "pmem-csi-controller"}.AsSelector(), 1 /* one replica */, time.Minute)
 			framework.ExpectNoError(err, "PMEM-CSI controller running with one replica")
 			controllerNode := pods.Items[0].Spec.NodeName
@@ -380,7 +525,7 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 			rebooted = true
 			restartNode(f.ClientSet, controllerNode, sc)
 
-			_, err = WaitForPodsWithLabelRunningReady(f.ClientSet, d.Namespace,
+			_, err = e2epod.WaitForPodsWithLabelRunningReady(f.ClientSet, d.Namespace,
 				labels.Set{"app.kubernetes.io/name": "pmem-csi-controller"}.AsSelector(), 1 /* one replica */, 5*time.Minute)
 			framework.ExpectNoError(err, "PMEM-CSI controller running again with one replica")
 
@@ -423,9 +568,8 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 						RequiredBytes: volSize,
 					},
 				}
-				volResp, err := ncc.CreateVolume(context.Background(), req)
+				_, err := resources.CreateVolume(context.Background(), req)
 				Expect(err).Should(BeNil(), "Failed to create volume on node")
-				cl.MaybeRegisterVolume(volName, volResp, err)
 
 				resp, err := ncc.GetCapacity(context.Background(), &csi.GetCapacityRequest{})
 				Expect(err).Should(BeNil(), "Failed to get node capacity after volume creation")
@@ -450,17 +594,89 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 			Expect(resp.AvailableCapacity).To(Equal(nodeCapacity), "capacity mismatch")
 		})
 
+		It("handle fragmentation", func() {
+			// The key idea behind this test is to create
+			// four volumes that consume all available
+			// space.  Then all but the second volume get
+			// deleted. That creates a situation where in
+			// direct mode, the largest volume size is
+			// smaller than the total available space.
+			//
+			// Because these volumes can be large, shredding gets disabled.
+			v.sc.Config.TestVolumeParameters = map[string]string{
+				parameters.EraseAfter: "false",
+			}
+			resp, err := ncc.GetCapacity(context.Background(), &csi.GetCapacityRequest{})
+			Expect(err).Should(BeNil(), "Failed to get node initial capacity")
+			nodeCapacity := resp.AvailableCapacity
+
+			if nodeCapacity%4 != 0 {
+				framework.Failf("total capacity %s not a multiple of 4", pmemlog.CapacityRef(nodeCapacity))
+			}
+			isFragmented := nodeCapacity > resp.MaximumVolumeSize.GetValue()
+			volumeSize := nodeCapacity / 4
+
+			// Round down to a 4Mi alignment for LVM mode.
+			lvmAlign := int64(4 * 1024 * 1024)
+			volumeSize = volumeSize / lvmAlign * lvmAlign
+
+			By(fmt.Sprintf("creating four volumes of %s each", pmemlog.CapacityRef(volumeSize)))
+			var volumes []*csi.Volume
+			for i := 0; i < 4; i++ {
+				v.namePrefix = fmt.Sprintf("frag-%d", i)
+				_, vol := v.create(volumeSize, nodeID)
+				volumes = append(volumes, vol)
+				resp, err := ncc.GetCapacity(context.Background(), &csi.GetCapacityRequest{})
+				Expect(err).Should(BeNil(), "Failed to get updated capacity")
+				Expect(pmemlog.CapacityRef(resp.AvailableCapacity).String()).To(Equal(pmemlog.CapacityRef(nodeCapacity-int64(i+1)*volumeSize).String()), "remaining capacity after creating volume #%d", i)
+				if i < 3 {
+					Expect(resp.MaximumVolumeSize).NotTo(BeNil(), "have MaximumVolumeSize")
+					Expect(resp.MaximumVolumeSize.Value).To(BeNumerically(">=", volumeSize), "MaximVolumeSize large enough for next volume")
+				}
+			}
+
+			By("deleting all but the second volume")
+			for i := 0; i < 4; i++ {
+				if i == 1 {
+					continue
+				}
+				vol := volumes[i]
+				_, err := v.cc.DeleteVolume(v.ctx, &csi.DeleteVolumeRequest{
+					VolumeId: vol.GetVolumeId(),
+				})
+				Expect(err).Should(BeNil(), fmt.Sprintf("Volume #%d cannot be deleted", i))
+			}
+
+			resp, err = ncc.GetCapacity(context.Background(), &csi.GetCapacityRequest{})
+			Expect(err).Should(BeNil(), "Failed to get capacity after deleting three volumes")
+			Expect(pmemlog.CapacityRef(resp.AvailableCapacity).String()).To(Equal(pmemlog.CapacityRef(nodeCapacity-volumeSize).String()), "available capacity while one volume exists")
+			Expect(resp.MaximumVolumeSize).NotTo(BeNil(), "have MaximumVolumeSize")
+			if d.Mode == api.DeviceModeLVM {
+				if !isFragmented {
+					// When there are, for example, two regions, then we have fragmentation also for LVM.
+					// This assumption only applies when we have a single volume group.
+					Expect(resp.MaximumVolumeSize.Value).To(BeNumerically(">=", 3*volumeSize), "MaximVolumeSize includes space of all three deleted volumes when using LVM")
+				}
+			} else {
+				Expect(pmemlog.CapacityRef(resp.MaximumVolumeSize.Value).String()).To(Equal(pmemlog.CapacityRef(2*volumeSize).String()), "MaximVolumeSize includes space of the last two deleted volumes when using direct mode")
+			}
+
+			By("creating one larger volume")
+			v.namePrefix = "frag-final"
+			v.create(resp.MaximumVolumeSize.Value, nodeID)
+		})
+
 		It("excessive message sizes should be rejected", func() {
 			req := &csi.GetCapacityRequest{
 				AccessibleTopology: &csi.Topology{
 					Segments: map[string]string{},
 				},
 			}
-			for i := 0; i < 100000; i++ {
+			for i := 0; i < 1000000; i++ {
 				req.AccessibleTopology.Segments[fmt.Sprintf("pmem-csi.intel.com/node%d", i)] = nodeID
 			}
-			_, err := cc.GetCapacity(context.Background(), req)
-			Expect(err).ShouldNot(BeNil(), "unexpected success for too large request")
+			resp, err := cc.GetCapacity(context.Background(), req)
+			Expect(err).ShouldNot(BeNil(), "unexpected success for too large request, got response: %+v", resp)
 			status, ok := status.FromError(err)
 			Expect(ok).Should(BeTrue(), "expected status in error, got: %v", err)
 			Expect(status.Message()).Should(ContainSubstring("grpc: received message larger than max"))
@@ -486,10 +702,28 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 			v.remove(vol, name)
 		})
 
+		It("CreateVolume handles zero size", func() {
+			_, vol := v.create(0, nodeID)
+			Expect(vol.CapacityBytes).Should(BeNumerically(">", int64(0)), "actual volume must have non-zero size")
+		})
+
 		It("CreateVolume should return ResourceExhausted", func() {
 			v.namePrefix = "resource-exhausted"
 
 			v.create(1024*1024*1024*1024*1024, nodeID, codes.ResourceExhausted)
+		})
+
+		It("NodeUnstageVolume for unknown volume", func() {
+			_, err := v.nc.NodeUnstageVolume(v.ctx, &csi.NodeUnstageVolumeRequest{
+				VolumeId:          "no-such-volume",
+				StagingTargetPath: "/foo/bar",
+			})
+			Expect(err).ShouldNot(BeNil(), "NodeUnstageVolume should have failed")
+			s, ok := status.FromError(err)
+			if !ok {
+				framework.Failf("Expected a status error, got %T: %v", err, err)
+			}
+			Expect(s.Code()).Should(BeEquivalentTo(codes.NotFound), "Expected volume not found")
 		})
 
 		It("stress test", func() {
@@ -600,29 +834,58 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 				volumes []*csi.ListVolumesResponse_Entry
 			}
 			var (
-				nodes map[string]nodeClient
+				nodes  map[string]nodeClient
+				ctx    context.Context
+				cancel func()
 			)
 
 			BeforeEach(func() {
+				ctx, cancel = context.WithCancel(context.Background())
+				l := testinglogger.New(GinkgoT(0))
+				ctx = logger.Set(ctx, l)
+
 				// Worker nodes with PMEM.
 				nodes = make(map[string]nodeClient)
-				for i := 1; i < cluster.NumNodes(); i++ {
-					addr := cluster.NodeServiceAddress(i, deploy.SocatPort)
-					conn, err := sanityutils.Connect(addr, grpc.WithInsecure())
-					framework.ExpectNoError(err, "connect to socat instance on node #%d via %s", i, addr)
+
+				// Find socat pods.
+				pods, err := f.ClientSet.CoreV1().Pods("").List(ctx,
+					metav1.ListOptions{
+						LabelSelector: labels.FormatLabels(map[string]string{
+							"app.kubernetes.io/component": "node-testing",
+							"app.kubernetes.io/instance":  "pmem-csi.intel.com",
+						}),
+					})
+				framework.ExpectNoError(err, "list socat pods")
+				if len(pods.Items) == 0 {
+					framework.Failf("expected some socat pods, found none")
+				}
+
+				for _, pod := range pods.Items {
+					dialer := grpc.WithDialer(
+						// Dial timeout has to be ignored because the pod dialer does not support that
+						// because the underlying code doesn't support it.
+						// The address is already known.
+						func(_ string, _ time.Duration) (net.Conn, error) {
+							return pmeme2epod.NewDialer(f.ClientSet, f.ClientConfig()).DialContainerPort(ctx, l, pmeme2epod.Addr{
+								Namespace: pod.Namespace,
+								PodName:   pod.Name,
+								Port:      deploy.SocatPort,
+							})
+						})
+					conn, err := grpc.Dial(pod.Spec.NodeName, dialer, grpc.WithInsecure())
+					framework.ExpectNoError(err, "gRPC connection to socat instance on node %s", pod.Spec.NodeName)
 					node := nodeClient{
-						host: addr,
+						host: pod.Spec.NodeName,
 						conn: conn,
 						nc:   csi.NewNodeClient(conn),
 						cc:   csi.NewControllerClient(conn),
 					}
-					info, err := node.nc.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
-					framework.ExpectNoError(err, "node name #%d", i+1)
-					initialVolumes, err := node.cc.ListVolumes(context.Background(), &csi.ListVolumesRequest{})
-					framework.ExpectNoError(err, "list volumes on node #%d", i)
+					info, err := node.nc.NodeGetInfo(ctx, &csi.NodeGetInfoRequest{})
+					framework.ExpectNoError(err, "CSI node name for node %s", pod.Spec.NodeName)
+					initialVolumes, err := node.cc.ListVolumes(ctx, &csi.ListVolumesRequest{})
+					framework.ExpectNoError(err, "list volumes on node %s", pod.Spec.NodeName)
 					node.volumes = initialVolumes.Entries
 
-					//nodes = append(nodes, node)
 					nodes[info.NodeId] = node
 				}
 			})
@@ -631,6 +894,7 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 				for _, node := range nodes {
 					node.conn.Close()
 				}
+				cancel()
 			})
 
 			It("supports persistent volumes", func() {
@@ -644,13 +908,13 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 				// Node now should have one additional volume only one node,
 				// and its size should match the requested one.
 				for nodeName, node := range nodes {
-					currentVolumes, err := node.cc.ListVolumes(context.Background(), &csi.ListVolumesRequest{})
+					currentVolumes, err := node.cc.ListVolumes(ctx, &csi.ListVolumesRequest{})
 					framework.ExpectNoError(err, "list volumes on node %s", nodeName)
 					if nodeName == volNodeName {
 						Expect(len(currentVolumes.Entries)).To(Equal(len(node.volumes)+1), "one additional volume on node %s", nodeName)
 						for _, e := range currentVolumes.Entries {
 							if e.Volume.VolumeId == vol.VolumeId {
-								Expect(e.Volume.CapacityBytes).To(Equal(sizeInBytes), "additional volume size on node #%s(%s)", nodeName, node.host)
+								Expect(e.Volume.CapacityBytes).To(Equal(vol.CapacityBytes), "additional volume size on node %s", nodeName)
 								break
 							}
 						}
@@ -673,21 +937,19 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 				// Node now should have one additional volume only one node,
 				// and its size should match the requested one.
 				node := nodes[nodeID]
-				currentVolumes, err := node.cc.ListVolumes(context.Background(), &csi.ListVolumesRequest{})
+				currentVolumes, err := node.cc.ListVolumes(ctx, &csi.ListVolumesRequest{})
 				framework.ExpectNoError(err, "list volumes on node %s", nodeID)
 				Expect(len(currentVolumes.Entries)).To(Equal(len(node.volumes)+1), "one additional volume on node %s", nodeID)
 				for _, e := range currentVolumes.Entries {
 					if e.Volume.VolumeId == vol.VolumeId {
-						Expect(e.Volume.CapacityBytes).To(Equal(sizeInBytes), "additional volume size on node #%s(%s)", nodeID, node.host)
+						Expect(e.Volume.CapacityBytes).To(Equal(vol.CapacityBytes), "additional volume size on node %s", nodeID)
 						break
 					}
 				}
 
 				v.publish(volName, vol)
 
-				i := strings.Split(nodeID, "worker")[1]
-
-				sshcmd := fmt.Sprintf("%s/_work/%s/ssh.%s", os.Getenv("REPO_ROOT"), os.Getenv("CLUSTER"), i)
+				sshcmd := fmt.Sprintf("%s/_work/%s/ssh.%s", os.Getenv("REPO_ROOT"), os.Getenv("CLUSTER"), nodeID)
 				// write some data to mounted volume
 				cmd := "sudo sh -c 'echo -n hello > " + v.getTargetPath() + "/target/test-file'"
 				ssh := exec.Command(sshcmd, cmd)
@@ -712,11 +974,11 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 				v.remove(vol, volName)
 			})
 
-			Context("ephemeral volumes", func() {
-				doit := func(withFlag bool, repeatCalls int) {
+			Context("CSI ephemeral volumes", func() {
+				doit := func(withFlag bool, repeatCalls int, fsType string) {
 					targetPath := sc.TargetPath + "/ephemeral"
 					params := map[string]string{
-						"size": "1Mi",
+						"size": "100Mi",
 					}
 					if withFlag {
 						params["csi.storage.k8s.io/ephemeral"] = "true"
@@ -726,7 +988,9 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 						VolumeContext: params,
 						VolumeCapability: &csi.VolumeCapability{
 							AccessType: &csi.VolumeCapability_Mount{
-								Mount: &csi.VolumeCapability_MountVolume{},
+								Mount: &csi.VolumeCapability_MountVolume{
+									FsType: fsType,
+								},
 							},
 							AccessMode: &csi.VolumeCapability_AccessMode{
 								Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
@@ -737,10 +1001,9 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 					published := false
 					var failedPublish, failedUnpublish error
 					for i := 0; i < repeatCalls; i++ {
-						_, err := nc.NodePublishVolume(context.Background(), &req)
+						_, err := nc.NodePublishVolume(ctx, &req)
 						if err == nil {
 							published = true
-							break
 						} else if failedPublish == nil {
 							failedPublish = fmt.Errorf("NodePublishVolume for ephemeral volume, attempt #%d: %v", i, err)
 						}
@@ -751,7 +1014,7 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 							TargetPath: targetPath,
 						}
 						for i := 0; i < repeatCalls; i++ {
-							_, err := nc.NodeUnpublishVolume(context.Background(), &req)
+							_, err := nc.NodeUnpublishVolume(ctx, &req)
 							if err != nil && failedUnpublish == nil {
 								failedUnpublish = fmt.Errorf("NodeUnpublishVolume for ephemeral volume, attempt #%d: %v", i, err)
 							}
@@ -762,13 +1025,21 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 				}
 
 				doall := func(withFlag bool) {
-					It("work", func() {
-						doit(withFlag, 1)
-					})
+					for _, fs := range []string{"default", "ext4", "xfs"} {
+						fsType := fs
+						if fsType == "default" {
+							fsType = ""
+						}
+						Context(fs+" FS", func() {
+							It("work", func() {
+								doit(withFlag, 1, fsType)
+							})
 
-					It("are idempotent", func() {
-						doit(withFlag, 10)
-					})
+							It("are idempotent", func() {
+								doit(withFlag, 10, fsType)
+							})
+						})
+					}
 				}
 
 				Context("with csi.storage.k8s.io/ephemeral", func() {
@@ -778,6 +1049,17 @@ var _ = deploy.DescribeForSome("sanity", func(d *deploy.Deployment) bool {
 				Context("without csi.storage.k8s.io/ephemeral", func() {
 					doall(false)
 				})
+			})
+
+			It("reports errors properly", func() {
+				for nodeName, node := range nodes {
+					_, err := node.cc.DeleteVolume(ctx, &csi.DeleteVolumeRequest{})
+					Expect(err).ToNot(BeNil(), "DeleteVolume with empty volume ID did not fail on node %s", nodeName)
+					Expect(err.Error()).To(ContainSubstring(nodeName+": "), "errors should contain node name")
+					status, ok := status.FromError(err)
+					Expect(ok).To(BeTrue(), "error type %T should have contained a gRPC status: %v", err, err)
+					Expect(status.Code().String()).To(Equal(codes.InvalidArgument.String()), "status code should be InvalidArgument")
+				}
 			})
 		})
 	})
@@ -789,7 +1071,7 @@ type volume struct {
 	sc          *sanity.TestContext
 	cc          csi.ControllerClient
 	nc          csi.NodeClient
-	cl          *sanity.Cleanup
+	resources   *sanity.Resources
 	stagingPath string
 	targetPath  string
 }
@@ -853,17 +1135,16 @@ func (v volume) create(sizeInBytes int64, nodeID string, expectedStatus ...codes
 	var vol *csi.CreateVolumeResponse
 	if len(expectedStatus) > 0 {
 		// Expected to fail, no retries.
-		vol, err = v.cc.CreateVolume(v.ctx, req)
+		vol, err = v.resources.CreateVolume(v.ctx, req)
 	} else {
 		// With retries.
 		err = v.retry(func() error {
-			vol, err = v.cc.CreateVolume(
+			vol, err = v.resources.CreateVolume(
 				v.ctx, req,
 			)
 			return err
 		}, "CreateVolume")
 	}
-	v.cl.MaybeRegisterVolume(name, vol, err)
 	if len(expectedStatus) > 0 {
 		framework.ExpectError(err, create)
 		status, ok := status.FromError(err)
@@ -875,7 +1156,7 @@ func (v volume) create(sizeInBytes int64, nodeID string, expectedStatus ...codes
 	Expect(vol).NotTo(BeNil())
 	Expect(vol.GetVolume()).NotTo(BeNil())
 	Expect(vol.GetVolume().GetVolumeId()).NotTo(BeEmpty())
-	Expect(vol.GetVolume().GetCapacityBytes()).To(Equal(sizeInBytes), "volume capacity")
+	Expect(vol.GetVolume().GetCapacityBytes()).To(BeNumerically(">=", sizeInBytes), "volume capacity")
 
 	return name, vol.GetVolume()
 }
@@ -991,7 +1272,7 @@ func (v volume) remove(vol *csi.Volume, volName string) {
 	By(delete)
 	var deletevol interface{}
 	err = v.retry(func() error {
-		deletevol, err = v.cc.DeleteVolume(
+		deletevol, err = v.resources.DeleteVolume(
 			v.ctx,
 			&csi.DeleteVolumeRequest{
 				VolumeId: vol.GetVolumeId(),
@@ -1001,8 +1282,6 @@ func (v volume) remove(vol *csi.Volume, volName string) {
 	}, "DeleteVolume")
 	framework.ExpectNoError(err, delete)
 	Expect(deletevol).NotTo(BeNil())
-
-	v.cl.UnregisterVolume(volName)
 }
 
 // retry will execute the operation (rapidly initially, then with
@@ -1101,33 +1380,4 @@ sudo sh -c 'echo b > /proc/sysrq-trigger'`)
 		By("Node driver: Probe success")
 		return true
 	}, "5m", "2s").Should(Equal(true), "node driver not ready")
-}
-
-// This is a copy from framework/utils.go with the fix from https://github.com/kubernetes/kubernetes/pull/78687
-// TODO: update to Kubernetes 1.15 (assuming that PR gets merged in time for that) and remove this function.
-func WaitForPodsWithLabelRunningReady(c clientset.Interface, ns string, label labels.Selector, num int, timeout time.Duration) (pods *v1.PodList, err error) {
-	var current int
-	err = wait.Poll(2*time.Second, timeout,
-		func() (bool, error) {
-			pods, err = e2epod.WaitForPodsWithLabel(c, ns, label)
-			if err != nil {
-				framework.Logf("Failed to list pods: %v", err)
-				if testutils.IsRetryableAPIError(err) {
-					return false, nil
-				}
-				return false, err
-			}
-			current = 0
-			for _, pod := range pods.Items {
-				if flag, err := testutils.PodRunningReady(&pod); err == nil && flag == true {
-					current++
-				}
-			}
-			if current != num {
-				framework.Logf("Got %v pods running and ready, expect: %v", current, num)
-				return false, nil
-			}
-			return true, nil
-		})
-	return pods, err
 }

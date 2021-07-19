@@ -31,6 +31,7 @@ import (
 
 	// test sources
 	_ "github.com/intel/pmem-csi/test/e2e/gotests"
+	_ "github.com/intel/pmem-csi/test/e2e/image"
 	_ "github.com/intel/pmem-csi/test/e2e/imagefile"
 	_ "github.com/intel/pmem-csi/test/e2e/metrics"
 	_ "github.com/intel/pmem-csi/test/e2e/operator"
@@ -50,8 +51,6 @@ func TestMain(m *testing.M) {
 	config.CopyFlags(config.Flags, flag.CommandLine)
 	framework.RegisterCommonFlags(flag.CommandLine)
 	framework.RegisterClusterFlags(flag.CommandLine)
-	// Skip slow or distruptive tests by default.
-	flag.Set("ginkgo.skip", `\[Slow|Disruptive\]`)
 	flag.Parse()
 
 	// Register framework flags, then handle flags.

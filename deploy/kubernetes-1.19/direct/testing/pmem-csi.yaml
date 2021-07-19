@@ -13,6 +13,14 @@ kind: ServiceAccount
 metadata:
   labels:
     pmem-csi.intel.com/deployment: direct-testing
+  name: pmem-csi-intel-com-node-setup
+  namespace: pmem-csi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    pmem-csi.intel.com/deployment: direct-testing
   name: pmem-csi-intel-com-webhooks
   namespace: pmem-csi
 ---
@@ -168,6 +176,20 @@ kind: ClusterRole
 metadata:
   labels:
     pmem-csi.intel.com/deployment: direct-testing
+  name: pmem-csi-intel-com-node-setup-runner
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    pmem-csi.intel.com/deployment: direct-testing
   name: pmem-csi-intel-com-webhooks-runner
 rules:
 - apiGroups:
@@ -231,6 +253,22 @@ kind: RoleBinding
 metadata:
   labels:
     pmem-csi.intel.com/deployment: direct-testing
+  name: pmem-csi-intel-com-node-openshift-cfg
+  namespace: pmem-csi
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+subjects:
+- kind: ServiceAccount
+  name: pmem-csi-intel-com-controller
+  namespace: pmem-csi
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    pmem-csi.intel.com/deployment: direct-testing
   name: pmem-csi-intel-com-webhooks-role-cfg
   namespace: pmem-csi
 roleRef:
@@ -262,6 +300,21 @@ kind: ClusterRoleBinding
 metadata:
   labels:
     pmem-csi.intel.com/deployment: direct-testing
+  name: pmem-csi-intel-com-node-setup-role
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pmem-csi-intel-com-node-setup-runner
+subjects:
+- kind: ServiceAccount
+  name: pmem-csi-intel-com-node-setup
+  namespace: pmem-csi
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    pmem-csi.intel.com/deployment: direct-testing
   name: pmem-csi-intel-com-webhooks-role
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -272,57 +325,8 @@ subjects:
   name: pmem-csi-intel-com-webhooks
   namespace: pmem-csi
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  labels:
-    pmem-csi.intel.com/deployment: direct-testing
-  name: pmem-csi-intel-com-controller
-  namespace: pmem-csi
-spec:
-  ports:
-  - port: 10000
-    targetPort: 10000
-  selector:
-    app.kubernetes.io/instance: pmem-csi.intel.com
-    app.kubernetes.io/name: pmem-csi-controller
-    pmem-csi.intel.com/deployment: direct-testing
----
-apiVersion: v1
-kind: Service
-metadata:
-  labels:
-    pmem-csi.intel.com/deployment: direct-testing
-  name: pmem-csi-intel-com-controller-testing
-  namespace: pmem-csi
-spec:
-  ports:
-  - port: 10002
-  selector:
-    app.kubernetes.io/instance: pmem-csi.intel.com
-    app.kubernetes.io/name: pmem-csi-controller
-    pmem-csi.intel.com/deployment: direct-testing
-  type: NodePort
----
-apiVersion: v1
-kind: Service
-metadata:
-  labels:
-    pmem-csi.intel.com/deployment: direct-testing
-  name: pmem-csi-intel-com-metrics
-  namespace: pmem-csi
-spec:
-  ports:
-  - port: 10010
-    targetPort: 10010
-  selector:
-    app.kubernetes.io/instance: pmem-csi.intel.com
-    app.kubernetes.io/name: pmem-csi-controller
-    pmem-csi.intel.com/deployment: direct-testing
-  type: NodePort
----
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   labels:
     app.kubernetes.io/component: controller
@@ -339,7 +343,6 @@ spec:
       app.kubernetes.io/instance: pmem-csi.intel.com
       app.kubernetes.io/name: pmem-csi-controller
       pmem-csi.intel.com/deployment: direct-testing
-  serviceName: pmem-csi-intel-com-controller
   template:
     metadata:
       annotations:
@@ -360,13 +363,12 @@ spec:
         - -mode=webhooks
         - -drivername=$(PMEM_CSI_DRIVER_NAME)
         - -nodeSelector={"storage":"pmem"}
-        - -caFile=/certs/ca.crt
+        - -caFile=
         - -certFile=/certs/tls.crt
         - -keyFile=/certs/tls.key
         - -schedulerListen=:8000
         - -metricsListen=:10010
         - -v=5
-        - -coverprofile=/var/lib/pmem-csi-coverage/pmem-csi-driver-controller-*.out
         env:
         - name: TERMINATION_LOG_PATH
           value: /dev/termination-log
@@ -376,49 +378,51 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        image: intel/pmem-csi-driver-test:canary
+        image: intel/pmem-csi-driver:canary
         imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 6
+          httpGet:
+            path: /metrics
+            port: metrics
+            scheme: HTTP
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
         name: pmem-driver
         ports:
         - containerPort: 10010
           name: metrics
+        resources:
+          requests:
+            cpu: 12m
+            memory: 128Mi
         securityContext:
           readOnlyRootFilesystem: true
+        startupProbe:
+          failureThreshold: 60
+          httpGet:
+            path: /metrics
+            port: metrics
+            scheme: HTTP
+          periodSeconds: 1
+          successThreshold: 1
+          timeoutSeconds: 5
         terminationMessagePath: /dev/termination-log
         volumeMounts:
         - mountPath: /certs
           name: webhook-cert
-        - mountPath: /var/lib/pmem-csi-coverage
-          name: coverage-dir
-      initContainers:
-      - command:
-        - chown
-        - -R
-        - pmem-csi:pmem-csi
-        - /var/lib/pmem-csi-coverage
-        image: intel/pmem-csi-driver-test:canary
-        imagePullPolicy: Always
-        name: coverage-init
-        securityContext:
-          privileged: true
-          runAsUser: 0
-        volumeMounts:
-        - mountPath: /var/lib/pmem-csi-coverage
-          name: coverage-dir
-      securityContext:
-        runAsUser: 1000
+      priorityClassName: system-cluster-critical
       serviceAccountName: pmem-csi-intel-com-webhooks
       tolerations:
       - effect: NoSchedule
-        key: node-role.kubernetes.io/master
+        operator: Exists
+      - effect: NoExecute
+        operator: Exists
       volumes:
       - name: webhook-cert
         secret:
           secretName: pmem-csi-intel-com-controller-secret
-      - hostPath:
-          path: /var/lib/pmem-csi-coverage
-          type: DirectoryOrCreate
-        name: coverage-dir
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -463,7 +467,6 @@ spec:
         - -pmemPercentage=100
         - -metricsListen=:10010
         - -v=5
-        - -coverprofile=/var/lib/pmem-csi-coverage/pmem-csi-driver-node-*.out
         env:
         - name: KUBE_NODE_NAME
           valueFrom:
@@ -474,15 +477,37 @@ spec:
           value: pmem-csi.intel.com
         - name: TERMINATION_LOG_PATH
           value: /tmp/termination-log
-        image: intel/pmem-csi-driver-test:canary
+        image: intel/pmem-csi-driver:canary
         imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 6
+          httpGet:
+            path: /metrics
+            port: metrics
+            scheme: HTTP
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
         name: pmem-driver
         ports:
         - containerPort: 10010
           name: metrics
+        resources:
+          requests:
+            cpu: 100m
+            memory: 250Mi
         securityContext:
           privileged: true
           runAsUser: 0
+        startupProbe:
+          failureThreshold: 300
+          httpGet:
+            path: /metrics
+            port: metrics
+            scheme: HTTP
+          periodSeconds: 1
+          successThreshold: 1
+          timeoutSeconds: 5
         terminationMessagePath: /tmp/termination-log
         volumeMounts:
         - mountPath: /var/lib/kubelet/plugins/kubernetes.io/csi
@@ -495,24 +520,29 @@ spec:
           name: dev-dir
         - mountPath: /sys
           name: sys-dir
+        - mountPath: /host-sys
+          name: sys-dir
         - mountPath: /csi
           name: socket-dir
         - mountPath: /var/lib/pmem-csi.intel.com
           mountPropagation: Bidirectional
           name: pmem-state-dir
-        - mountPath: /var/lib/pmem-csi-coverage
-          name: coverage-dir
       - args:
         - -v=3
         - --kubelet-registration-path=/var/lib/kubelet/plugins/$(PMEM_CSI_DRIVER_NAME)/csi.sock
         - --csi-address=/csi/csi.sock
+        - --timeout=10s
         - -v=5
         env:
         - name: PMEM_CSI_DRIVER_NAME
           value: pmem-csi.intel.com
-        image: k8s.gcr.io/sig-storage/csi-node-driver-registrar:v1.2.0
+        image: k8s.gcr.io/sig-storage/csi-node-driver-registrar:v2.2.0
         imagePullPolicy: IfNotPresent
         name: driver-registrar
+        resources:
+          requests:
+            cpu: 12m
+            memory: 128Mi
         securityContext:
           readOnlyRootFilesystem: true
         volumeMounts:
@@ -529,6 +559,7 @@ spec:
         - --immediate-topology=false
         - --timeout=5m
         - --default-fstype=ext4
+        - --worker-threads=5
         - --metrics-address=:10011
         - -v=5
         env:
@@ -537,20 +568,48 @@ spec:
             fieldRef:
               apiVersion: v1
               fieldPath: spec.nodeName
-        image: gcr.io/k8s-staging-sig-storage/csi-provisioner:canary
+        image: k8s.gcr.io/sig-storage/csi-provisioner:v2.2.2
         imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 6
+          httpGet:
+            path: /metrics
+            port: metrics
+            scheme: HTTP
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
         name: external-provisioner
         ports:
         - containerPort: 10011
           name: metrics
+        resources:
+          requests:
+            cpu: 12m
+            memory: 128Mi
         securityContext:
           readOnlyRootFilesystem: true
+        startupProbe:
+          failureThreshold: 300
+          httpGet:
+            path: /metrics
+            port: metrics
+            scheme: HTTP
+          periodSeconds: 1
+          successThreshold: 1
+          timeoutSeconds: 5
         volumeMounts:
         - mountPath: /csi
           name: socket-dir
       nodeSelector:
         storage: pmem
+      priorityClassName: system-node-critical
       serviceAccountName: pmem-csi-intel-com-controller
+      tolerations:
+      - effect: NoSchedule
+        operator: Exists
+      - effect: NoExecute
+        operator: Exists
       volumes:
       - hostPath:
           path: /var/lib/kubelet/plugins/pmem-csi.intel.com
@@ -580,10 +639,85 @@ spec:
           path: /sys
           type: DirectoryOrCreate
         name: sys-dir
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 1
+    type: RollingUpdate
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app.kubernetes.io/component: node-setup
+    app.kubernetes.io/instance: pmem-csi.intel.com
+    app.kubernetes.io/name: pmem-csi-node-setup
+    app.kubernetes.io/part-of: pmem-csi
+    pmem-csi.intel.com/deployment: direct-testing
+  name: pmem-csi-intel-com-node-setup
+  namespace: pmem-csi
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: pmem-csi.intel.com
+      app.kubernetes.io/name: pmem-csi-node-setup
+      pmem-csi.intel.com/deployment: direct-testing
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: node-setup
+        app.kubernetes.io/instance: pmem-csi.intel.com
+        app.kubernetes.io/name: pmem-csi-node-setup
+        app.kubernetes.io/part-of: pmem-csi
+        pmem-csi.intel.com/deployment: direct-testing
+        pmem-csi.intel.com/webhook: ignore
+    spec:
+      containers:
+      - command:
+        - /usr/local/bin/pmem-csi-driver
+        - -v=3
+        - -logging-format=text
+        - -mode=force-convert-raw-namespaces
+        - -nodeSelector={"storage":"pmem"}
+        - -nodeid=$(KUBE_NODE_NAME)
+        env:
+        - name: KUBE_NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
+        - name: TERMINATION_LOG_PATH
+          value: /tmp/termination-log
+        image: intel/pmem-csi-driver:canary
+        imagePullPolicy: IfNotPresent
+        name: pmem-driver
+        securityContext:
+          privileged: true
+          runAsUser: 0
+        terminationMessagePath: /tmp/termination-log
+        volumeMounts:
+        - mountPath: /dev
+          name: dev-dir
+        - mountPath: /sys
+          name: sys-dir
+        - mountPath: /host-sys
+          name: sys-dir
+      nodeSelector:
+        pmem-csi.intel.com/convert-raw-namespaces: force
+      serviceAccountName: pmem-csi-intel-com-node-setup
+      tolerations:
+      - effect: NoSchedule
+        operator: Exists
+      - effect: NoExecute
+        operator: Exists
+      volumes:
       - hostPath:
-          path: /var/lib/pmem-csi-coverage
+          path: /dev
           type: DirectoryOrCreate
-        name: coverage-dir
+        name: dev-dir
+      - hostPath:
+          path: /sys
+          type: DirectoryOrCreate
+        name: sys-dir
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -619,6 +753,9 @@ spec:
         - unix-connect:/csi/csi.sock
         image: alpine/socat:1.0.3
         name: socat
+        ports:
+        - containerPort: 9735
+          name: csi-socket
         securityContext:
           privileged: true
         volumeMounts:
@@ -630,7 +767,14 @@ spec:
         - mountPath: /var/lib/kubelet/plugins/kubernetes.io/csi/pv
           mountPropagation: Bidirectional
           name: staging-dir
-      hostNetwork: true
+      nodeSelector:
+        storage: pmem
+      priorityClassName: system-node-critical
+      tolerations:
+      - effect: NoSchedule
+        operator: Exists
+      - effect: NoExecute
+        operator: Exists
       volumes:
       - hostPath:
           path: /var/lib/kubelet/plugins/pmem-csi.intel.com
@@ -645,7 +789,7 @@ spec:
           type: DirectoryOrCreate
         name: mountpoint-dir
 ---
-apiVersion: storage.k8s.io/v1beta1
+apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
   labels:

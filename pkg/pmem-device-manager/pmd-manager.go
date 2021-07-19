@@ -1,9 +1,11 @@
 package pmdmanager
 
 import (
+	"context"
 	"fmt"
 
 	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1beta1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 const (
@@ -41,8 +43,22 @@ type Capacity struct {
 	Total uint64
 }
 
-func (c Capacity) GetCapacity() (Capacity, error) {
+func (c Capacity) GetCapacity(ctx context.Context) (Capacity, error) {
 	return c, nil
+}
+
+func (c Capacity) String() string {
+	return fmt.Sprintf("%s maximum volume size, %s available, %s managed, %s total",
+		prettyPrintSize(c.MaxVolumeSize),
+		prettyPrintSize(c.Available),
+		prettyPrintSize(c.Managed),
+		prettyPrintSize(c.Total),
+	)
+}
+
+func prettyPrintSize(size uint64) string {
+	quantity := resource.NewQuantity(int64(size), resource.BinarySI)
+	return quantity.String()
 }
 
 var _ PmemDeviceCapacity = Capacity{}
@@ -50,7 +66,7 @@ var _ PmemDeviceCapacity = Capacity{}
 // PmemDeviceCapacity interface just returns capacity information.
 type PmemDeviceCapacity interface {
 	// GetCapacity returns information about local capacity.
-	GetCapacity() (Capacity, error)
+	GetCapacity(ctx context.Context) (Capacity, error)
 }
 
 //PmemDeviceManager interface to manage the PMEM block devices
@@ -60,32 +76,33 @@ type PmemDeviceManager interface {
 	// GetName returns current device manager's operation mode
 	GetMode() api.DeviceMode
 
-	// CreateDevice creates a new block device with give name, size and namespace mode
+	// CreateDevice creates a new block device with give name, size and namespace mode.
+	// It returns the actual volume size which will always be at least as large as requested.
 	// Possible errors: ErrNotEnoughSpace, ErrDeviceExists
-	CreateDevice(name string, size uint64) error
+	CreateDevice(ctx context.Context, name string, size uint64) (uint64, error)
 
 	// GetDevice returns the block device information for given name
 	// Possible errors: ErrDeviceNotFound
-	GetDevice(name string) (*PmemDeviceInfo, error)
+	GetDevice(ctx context.Context, name string) (*PmemDeviceInfo, error)
 
 	// DeleteDevice deletes an existing block device with give name.
 	// If 'flush' is 'true', then the device data is zeroed before deleting the device
 	// Possible errors: ErrDeviceInUse
-	DeleteDevice(name string, flush bool) error
+	DeleteDevice(ctx context.Context, name string, flush bool) error
 
 	// ListDevices returns all the block devices information that was created by this device manager
-	ListDevices() ([]*PmemDeviceInfo, error)
+	ListDevices(ctx context.Context) ([]*PmemDeviceInfo, error)
 }
 
 // New creates a new device manager for the given mode and percentage.
-func New(mode api.DeviceMode, pmemPercentage uint) (PmemDeviceManager, error) {
+func New(ctx context.Context, mode api.DeviceMode, pmemPercentage uint) (PmemDeviceManager, error) {
 	switch mode {
 	case api.DeviceModeFake:
 		return newFake(pmemPercentage)
 	case api.DeviceModeLVM:
-		return newPmemDeviceManagerLVM(pmemPercentage)
+		return newPmemDeviceManagerLVM(ctx, pmemPercentage)
 	case api.DeviceModeDirect:
-		return newPmemDeviceManagerNdctl(pmemPercentage)
+		return newPmemDeviceManagerNdctl(ctx, pmemPercentage)
 	default:
 		return nil, fmt.Errorf("unsupported device mode %q", mode)
 	}

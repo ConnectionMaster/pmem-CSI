@@ -7,17 +7,20 @@ SPDX-License-Identifier: Apache-2.0
 package k8sutil
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"regexp"
 	"strconv"
 
 	"github.com/intel/pmem-csi/pkg/version"
+	apiclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/klog/v2"
 )
 
 // NewClient connects to an API server either through KUBECONFIG (if set) or
@@ -54,8 +57,6 @@ func GetKubernetesVersion(cfg *rest.Config) (*version.Version, error) {
 		return nil, err
 	}
 
-	klog.Infof("Kubernetes version read from server: %v.%v", ver.Major, ver.Minor)
-
 	// Suppress all non digits, version might contain special charcters like, <number>+
 	reg, _ := regexp.Compile("[^0-9]+")
 	major, err := strconv.Atoi(reg.ReplaceAllString(ver.Major, ""))
@@ -69,4 +70,20 @@ func GetKubernetesVersion(cfg *rest.Config) (*version.Version, error) {
 
 	v := version.NewVersion(uint(major), uint(minor))
 	return &v, nil
+}
+
+// IsOpenShift determines whether the cluster is based on OpenShift.
+func IsOpenShift(cfg *rest.Config) (bool, error) {
+	client, err := apiclient.NewForConfig(cfg)
+	if err != nil {
+		return false, err
+	}
+	// For our purposed we run on OpenShift if the scheduler operator is installed.
+	if _, err := client.ApiextensionsV1().CustomResourceDefinitions().Get(context.Background(), "schedulers.config.openshift.io", metav1.GetOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("check for OpenShift CRD: %v", err)
+	}
+	return true, nil
 }
