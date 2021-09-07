@@ -56,7 +56,7 @@ require (
 	k8s.io/kube-openapi v0.0.0-20200923155610-8b5066479488 // indirect
 	k8s.io/kube-scheduler v0.19.2
 	k8s.io/kubectl v0.19.2
-	k8s.io/kubernetes v1.19.2
+	k8s.io/kubernetes v1.19.11
 	k8s.io/utils v0.0.0-20201110183641-67b214c5f920
 	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.0.12 // indirect
 	sigs.k8s.io/controller-runtime v0.8.0
